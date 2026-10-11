@@ -1,679 +1,336 @@
-"""
-AI Stock Analyzer v2
-====================
-Verschil met v1: het signaal wordt alleen als betrouwbaar getoond wanneer de
-modellen in een walk-forward test (out-of-sample, met purge) aantoonbaar beter
-zijn dan een naieve basislijn. Anders staat er "ONVOLDOENDE BEWIJS".
-
-Geen financieel advies.
-"""
-import time
-import warnings
-
-import numpy as np
-import pandas as pd
-import streamlit as st
 import yfinance as yf
-from sklearn.ensemble import RandomForestClassifier
+import pandas as pd
+import numpy as np
+import warnings
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, roc_auc_score
-from sklearn.pipeline import make_pipeline
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.neural_network import MLPClassifier
+import xgboost as xgb
+import lightgbm as lgb
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import StandardScaler
+from datetime import datetime
+import time
 
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# CONFIGURATIE: ~50 POPULAIRE TICKERS
+# ==========================================
+TICKERS = [
+    # Tech Giants
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM",
+    "ADBE", "ORCL", "CSCO", "IBM", "QCOM", "TXN", "AVGO", "NOW", "PANW", "SNOW",
+    
+    # Finance
+    "JPM", "BAC", "WFC", "GS", "MS", "V", "MA", "PYPL", "SQ", "COIN",
+    
+    # Healthcare
+    "JNJ", "UNH", "PFE", "MRNA", "ABBV", "LLY", "TMO", "ABT", "BMY", "GILD",
+    
+    # Consumer & Retail
+    "WMT", "COST", "HD", "NKE", "SBUX", "MCD", "TGT", "DIS", "NFLX", "SPOT",
+    
+    # Energy & Industrial
+    "XOM", "CVX", "COP", "SLB", "BA", "CAT", "GE", "HON", "UPS", "FDX"
+]
+
+print(f"📊 Verwerken van {len(TICKERS)} tickers...")
+print(f"   Start tijd: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+# ==========================================
+# BATCH DATA OPHALEN (Efficiënt voor 50+ tickers)
+# ==========================================
+print("📥 Data ophalen in batches...")
 try:
-    import xgboost as xgb
-except Exception:  # pragma: no cover
-    xgb = None
-try:
-    import lightgbm as lgb
-except Exception:  # pragma: no cover
-    lgb = None
+    # Download alle data tegelijk (veel sneller dan per ticker)
+    all_data = yf.download(
+        TICKERS, 
+        start="2020-01-01", 
+        end="2026-10-12",
+        progress=False,
+        threads=True
+    )
+    
+    # Handle multi-index columns
+    if isinstance(all_data.columns, pd.MultiIndex):
+        close_data = all_data['Close']
+        volume_data = all_data['Volume']
+    else:
+        close_data = all_data[['Close']]
+        volume_data = all_data[['Volume']]
+    
+    print(f"✅ Data opgehaald voor {len(TICKERS)} tickers\n")
+    
+except Exception as e:
+    print(f"❌ Fout bij ophalen data: {e}")
+    print("💡 Tip: Probeer kleinere batches (bijv. 10 tickers per keer)")
+    exit()
 
-warnings.filterwarnings("ignore")
+# ==========================================
+# FEATURE ENGINEERING FUNCTIE
+# ==========================================
+def create_features(df_close, df_volume):
+    """Maak technische features voor een enkel aandeel"""
+    df = pd.DataFrame({
+        'Close': df_close,
+        'Volume': df_volume
+    })
+    
+    # Returns
+    df['Return_1d'] = df['Close'].pct_change(1)
+    df['Return_3d'] = df['Close'].pct_change(3)
+    df['Return_5d'] = df['Close'].pct_change(5)
+    
+    # Moving Averages
+    df['SMA_5'] = df['Close'].rolling(window=5).mean()
+    df['SMA_10'] = df['Close'].rolling(window=10).mean()
+    df['SMA_20'] = df['Close'].rolling(window=20).mean()
+    
+    # Volatility & RSI
+    df['Volatility_10'] = df['Return_1d'].rolling(window=10).std()
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI_14'] = 100 - (100 / (1 + rs))
+    
+    # Target: 1 als volgende dag hoger sluit
+    df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
+    
+    return df.dropna()
 
-SEED = 42
-H_SHORT = 5                                # 1 week = 5 handelsdagen
-H_LONG = {"1 jaar": 252, "2 jaar": 504}
-BLOCK = 21                                 # lengte validatieblok (handelsdagen)
-MIN_TRAIN = 250                            # minimaal aantal trainingsrijen
-MIN_OOS = 100                              # minimaal aantal out-of-sample dagen
-MIN_EFF_N = 20                             # minimaal aantal "onafhankelijke" metingen
+# ==========================================
+# LSTM MODEL DEFINITIE
+# ==========================================
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=32, num_layers=2):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return self.sigmoid(out)
 
-# ----------------------------------------------------------------------------
-# Data
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_prices(ticker: str, period: str) -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval="1d",
-                     auto_adjust=True, progress=False)
-    if df is None or df.empty:
-        raise ValueError("Geen koersdata gevonden voor deze ticker")
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    needed = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"Kolommen ontbreken: {missing}")
-    df = df[needed].dropna(subset=["Close"]).sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-    if len(df) < 500:
-        raise ValueError(f"Te weinig historie ({len(df)} dagen, minimaal 500)")
-    return df
+def create_sequences(X, y, seq_length=10):
+    X_seq, y_seq = [], []
+    for i in range(len(X) - seq_length):
+        X_seq.append(X.iloc[i:i+seq_length].values)
+        y_seq.append(y.iloc[i+seq_length])
+    return np.array(X_seq), np.array(y_seq)
 
-
-def make_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Alleen stationaire features (geen ruwe prijsniveaus)."""
-    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-    f = pd.DataFrame(index=df.index)
-
-    for n in (1, 5, 10, 20, 60):
-        f[f"ret_{n}"] = c.pct_change(n)
-
-    sma10, sma20, sma50 = (c.rolling(n).mean() for n in (10, 20, 50))
-    f["dist_sma10"] = c / sma10 - 1
-    f["dist_sma50"] = c / sma50 - 1
-    f["sma10_vs_sma50"] = sma10 / sma50 - 1
-
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    f["macd_pct"] = macd / c
-    f["macd_hist_pct"] = (macd - macd.ewm(span=9, adjust=False).mean()) / c
-
-    # RSI met Wilder-smoothing
-    delta = c.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    f["rsi"] = (100 - 100 / (1 + gain / loss)) / 100
-
-    r1 = c.pct_change()
-    vol10, vol20 = r1.rolling(10).std(), r1.rolling(20).std()
-    f["vol_20"] = vol20
-    f["vol_ratio"] = vol10 / vol20
-
-    prev_close = c.shift(1)
-    tr = pd.concat([h - l, (h - prev_close).abs(), (l - prev_close).abs()], axis=1).max(axis=1)
-    f["atr_pct"] = tr.rolling(14).mean() / c
-
-    f["volume_ratio"] = v / v.rolling(20).mean().replace(0, np.nan)
-    f["dist_high_252"] = c / c.rolling(252, min_periods=100).max() - 1
-    f["boll_pos"] = (c - sma20) / (2 * c.rolling(20).std())
-
-    return f.replace([np.inf, -np.inf], np.nan)
-
-
-def make_target(close: pd.Series, horizon: int) -> pd.Series:
-    """1 als de koers over `horizon` dagen hoger staat, 0 als niet, NaN als nog onbekend."""
-    fwd = close.shift(-horizon) / close - 1
-    y = (fwd > 0).astype(float)
-    y[fwd.isna()] = np.nan
-    return y
-
-
-# ----------------------------------------------------------------------------
-# Modellen
-# ----------------------------------------------------------------------------
-def short_models() -> dict:
+# ==========================================
+# MODEL TRAINING FUNCTIE
+# ==========================================
+def train_all_models(df, ticker):
+    """Train alle 8 modellen voor één aandeel"""
+    
+    feature_cols = ['Return_1d', 'Return_3d', 'Return_5d', 'SMA_5', 'SMA_10', 
+                    'SMA_20', 'Volatility_10', 'RSI_14']
+    
+    # Check of er genoeg data is
+    if len(df) < 100:
+        return None, f"Niet genoeg data ({len(df)} rijen)"
+    
+    # Chronologische split (80/20)
+    split_idx = int(len(df) * 0.8)
+    train_df = df.iloc[:split_idx]
+    test_df = df.iloc[split_idx:]
+    
+    X_train, y_train = train_df[feature_cols], train_df['Target']
+    X_test, y_test = test_df[feature_cols], test_df['Target']
+    
+    # Traditionele modellen
     models = {
-        "Logistic Regression": lambda: make_pipeline(
-            StandardScaler(), LogisticRegression(C=0.1, max_iter=1000)),
-        "Random Forest": lambda: RandomForestClassifier(
-            n_estimators=150, max_depth=4, min_samples_leaf=30,
-            max_features="sqrt", random_state=SEED, n_jobs=1),
+        "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+        "SVM": SVC(kernel='rbf', probability=True, random_state=42),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
+        "Gradient Boosting": GradientBoostingClassifier(n_estimators=100, random_state=42),
+        "XGBoost": xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=42, 
+                                     eval_metric='logloss', verbosity=0),
+        "LightGBM": lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, random_state=42, 
+                                       verbose=-1),
+        "MLP": MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
     }
-    if xgb is not None:
-        models["XGBoost"] = lambda: xgb.XGBClassifier(
-            n_estimators=150, max_depth=2, learning_rate=0.03, subsample=0.8,
-            colsample_bytree=0.8, min_child_weight=20, reg_lambda=5.0,
-            eval_metric="logloss", random_state=SEED, n_jobs=1, verbosity=0)
-    if lgb is not None:
-        models["LightGBM"] = lambda: lgb.LGBMClassifier(
-            n_estimators=150, learning_rate=0.03, num_leaves=4,
-            min_child_samples=30, subsample=0.8, subsample_freq=1,
-            colsample_bytree=0.8, reg_lambda=5.0, random_state=SEED,
-            n_jobs=1, verbosity=-1)
-    return models
-
-
-def long_models() -> dict:
-    return {
-        "Logistic Regression": lambda: make_pipeline(
-            StandardScaler(), LogisticRegression(C=0.05, max_iter=1000)),
-        "Random Forest": lambda: RandomForestClassifier(
-            n_estimators=150, max_depth=3, min_samples_leaf=50,
-            max_features="sqrt", random_state=SEED, n_jobs=1),
-    }
-
-
-def proba_up(model, X) -> np.ndarray:
-    p = model.predict_proba(X)
-    classes = list(model.classes_)
-    if 1 not in classes:
-        return np.zeros(len(X))
-    return p[:, classes.index(1)]
-
-
-# ----------------------------------------------------------------------------
-# Validatie
-# ----------------------------------------------------------------------------
-def walk_forward(X, y, horizon, factories, n_blocks, block=BLOCK, min_train=MIN_TRAIN):
-    """
-    Expanding-window walk-forward met purge.
-    Training eindigt `horizon` rijen voor het begin van het testblok, zodat de
-    labels van de training nooit in de testperiode kijken.
-    """
-    n = len(X)
-    parts = []
-    for b in range(n_blocks):
-        end = n - b * block
-        start = end - block
-        train_end = start - horizon
-        if train_end < min_train:
-            break
-        ytr = y.iloc[:train_end]
-        if ytr.nunique() < 2:
-            continue
-        part = pd.DataFrame(index=X.index[start:end])
-        for name, make in factories.items():
-            m = make()
-            m.fit(X.iloc[:train_end], ytr)
-            part[name] = proba_up(m, X.iloc[start:end])
-        part["y"] = y.iloc[start:end].values
-        parts.append(part)
-    if not parts:
-        return None
-    return pd.concat(parts).sort_index()
-
-
-def oos_metrics(oos: pd.DataFrame, names: list, horizon: int) -> dict:
-    y = oos["y"].astype(int).values
-    ens = oos[names].mean(axis=1).values
-    out = {
-        "n_oos": int(len(y)),
-        "eff_n": len(y) / horizon,
-        "base_up": float(y.mean()),
-        "auc": np.nan, "brier": np.nan, "brier_base": np.nan,
-        "acc": float(((ens > 0.5) == y).mean()),
-        "hit_bull": np.nan, "n_bull": 0, "per_model_auc": {},
-    }
-    if len(np.unique(y)) < 2:
-        return out
-    out["auc"] = float(roc_auc_score(y, ens))
-    out["brier"] = float(brier_score_loss(y, ens))
-    out["brier_base"] = float(brier_score_loss(y, np.full(len(y), y.mean())))
-    bull = ens >= 0.55
-    out["n_bull"] = int(bull.sum())
-    if bull.sum() >= 10:
-        out["hit_bull"] = float(y[bull].mean())
-    for n in names:
-        out["per_model_auc"][n] = float(roc_auc_score(y, oos[n].values))
-    return out
-
-
-# ----------------------------------------------------------------------------
-# Indicatorscore voor daytrade / korte swingtrade (3-5 dagen)
-# Regelgebaseerd (niet gefit): elke indicator stemt +1 / 0 / -1.
-# ----------------------------------------------------------------------------
-IND_BULL, IND_BEAR = 65.0, 35.0
-
-
-def ind_label(score: float) -> str:
-    if score >= IND_BULL:
-        return "BULLISH"
-    if score <= IND_BEAR:
-        return "BEARISH"
-    return "NEUTRAAL"
-
-
-def compute_indicators(df: pd.DataFrame):
-    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
-    sma10, sma20, sma50 = (c.rolling(n).mean() for n in (10, 20, 50))
-
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_hist = (macd - macd.ewm(span=9, adjust=False).mean()) / c * 100
-
-    delta = c.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    rsi = 100 - 100 / (1 + gain / loss)
-
-    low14, high14 = l.rolling(14).min(), h.rolling(14).max()
-    stoch = ((c - low14) / (high14 - low14).replace(0, np.nan) * 100).rolling(3).mean()
-
-    bb_std = c.rolling(20).std()
-    pctb = (c - (sma20 - 2 * bb_std)) / (4 * bb_std).replace(0, np.nan)
-
-    roc3 = c.pct_change(3) * 100
-    vol_ratio = v / v.rolling(20).mean().replace(0, np.nan)
-    day_ret = c.pct_change()
-
-    prev = c.shift(1)
-    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
-    atr_pct = tr.rolling(14).mean() / c * 100
-
-    def vote(ref, up, down):
-        out = up.astype(float) - down.astype(float)
-        out[ref.isna()] = np.nan
-        return out
-
-    spec = [
-        ("Koers vs SMA10", np.sign(c - sma10), (c / sma10 - 1) * 100, "{:+.1f}%"),
-        ("SMA10 vs SMA20", np.sign(sma10 - sma20), (sma10 / sma20 - 1) * 100, "{:+.1f}%"),
-        ("Koers vs SMA50", np.sign(c - sma50), (c / sma50 - 1) * 100, "{:+.1f}%"),
-        ("MACD-histogram", np.sign(macd_hist), macd_hist, "{:+.2f}%"),
-        ("RSI(14) momentum", vote(rsi, rsi > 55, rsi < 45), rsi, "{:.0f}"),
-        ("3-daags momentum", np.sign(roc3), roc3, "{:+.1f}%"),
-        ("Stochastic (oversold/overbought)", vote(stoch, stoch < 20, stoch > 80), stoch, "{:.0f}"),
-        ("Bollinger %B (terugval/uitputting)", vote(pctb, pctb < 0.1, pctb > 0.9), pctb, "{:.2f}"),
-        ("Volume-bevestiging",
-         vote(vol_ratio, (vol_ratio > 1.2) & (day_ret > 0), (vol_ratio > 1.2) & (day_ret < 0)),
-         vol_ratio, "{:.1f}x"),
-    ]
-    votes = pd.DataFrame({n: s for n, s, _, _ in spec}).replace([np.inf, -np.inf], np.nan)
-    values = pd.DataFrame({n: x for n, _, x, _ in spec})
-    fmts = {n: f for n, _, _, f in spec}
-    return votes, values, fmts, atr_pct
-
-
-def indicator_summary(df: pd.DataFrame):
-    votes, values, fmts, atr_pct = compute_indicators(df)
-    valid = votes.dropna()
-    if valid.empty or valid.index[-1] != df.index[-1]:
-        return None
-    n = votes.shape[1]
-    score_s = (valid.sum(axis=1) + n) / (2 * n) * 100
-    last = valid.index[-1]
-    names = {1.0: "BULLISH", -1.0: "BEARISH", 0.0: "NEUTRAAL"}
-
-    rows = []
-    for col in votes.columns:
-        val = values.at[last, col]
-        rows.append({"Indicator": col,
-                     "Waarde": fmts[col].format(val) if pd.notna(val) else "-",
-                     "Stem": names[float(valid.at[last, col])]})
-
-    # Historische check van de vaste regels: wat gebeurde er na een hoge score?
-    close = df["Close"]
-    hist = {}
-    for hz in (3, 5):
-        fwd = close.shift(-hz) / close - 1
-        s = score_s.reindex(close.index)
-        known = fwd.notna() & s.notna()
-        sel = known & (s >= IND_BULL)
-        enough = sel.sum() >= 20
-        hist[hz] = {
-            "n": int(sel.sum()),
-            "hit": float((fwd[sel] > 0).mean()) if enough else np.nan,
-            "avg": float(fwd[sel].mean() * 100) if enough else np.nan,
-            "base_hit": float((fwd[known] > 0).mean()),
-            "base_avg": float(fwd[known].mean() * 100),
-        }
-
-    score = float(score_s.iloc[-1])
-    atr = atr_pct.iloc[-1]
-    return {"score": score, "label": ind_label(score), "rows": rows,
-            "atr_pct": float(atr) if pd.notna(atr) else np.nan, "hist": hist}
-
-
-# ----------------------------------------------------------------------------
-# Analyse (zwaar -> gecached) en classificatie (licht)
-# ----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner=False)
-def analyze_ticker(ticker: str, period: str, n_blocks: int) -> dict:
-    df = load_prices(ticker, period)
-    feats = make_features(df).dropna()
-    if len(feats) < 400:
-        raise ValueError("Te weinig bruikbare rijen na berekenen van features")
-    close = df["Close"]
-    x_latest = feats.iloc[[-1]]
-
-    rows = []
-
-    # --- Korte termijn (1 week) met walk-forward validatie ---
-    y = make_target(close, H_SHORT).reindex(feats.index)
-    labeled = y.notna()
-    Xl, yl = feats[labeled], y[labeled].astype(int)
-    if yl.nunique() < 2:
-        raise ValueError("Doelvariabele heeft maar 1 klasse")
-
-    factories = short_models()
-    oos = walk_forward(Xl, yl, H_SHORT, factories, n_blocks)
-    metrics = oos_metrics(oos, list(factories), H_SHORT) if oos is not None else None
-
-    probs = []
-    for name, make in factories.items():
-        m = make()
-        m.fit(Xl, yl)
-        p = float(proba_up(m, x_latest)[0])
-        probs.append(p)
-        auc = metrics["per_model_auc"].get(name, np.nan) if metrics else np.nan
-        rows.append({"Model": name, "Horizon": "1 week", "p": p,
-                     "OOS AUC": auc, "Gevalideerd": metrics is not None})
-    p_ens = float(np.mean(probs))
-    agree = float(np.mean([p > 0.5 for p in probs]))
-
-    # --- Lange termijn: alleen indicatief (niet statistisch valideerbaar) ---
-    long_p = {}
-    for label, hz in H_LONG.items():
-        yy = make_target(close, hz).reindex(feats.index)
-        lab = yy.notna()
-        if lab.sum() < 300 or yy[lab].nunique() < 2:
-            continue
-        ps = []
-        for name, make in long_models().items():
-            m = make()
-            m.fit(feats[lab], yy[lab].astype(int))
-            p = float(proba_up(m, x_latest)[0])
-            ps.append(p)
-            rows.append({"Model": name, "Horizon": f"{label} (indicatief)", "p": p,
-                         "OOS AUC": np.nan, "Gevalideerd": False})
-        long_p[label] = float(np.mean(ps))
-
-    return {
-        "ticker": ticker,
-        "last_date": str(feats.index[-1].date()),
-        "table": pd.DataFrame(rows),
-        "p": p_ens,
-        "agree": agree,
-        "metrics": metrics,
-        "long_p": long_p,
-        "n_train": int(len(Xl)),
-        "ind": indicator_summary(df),
-    }
-
-
-def classify(res: dict, p_buy: float, p_strong: float, min_agree: float, min_auc: float) -> dict:
-    m, p, agree = res["metrics"], res["p"], res["agree"]
-    p_strong = max(p_strong, p_buy)
-
-    reasons = []
-    if m is None:
-        reasons.append("te weinig data voor walk-forward validatie")
-    else:
-        if m["n_oos"] < MIN_OOS:
-            reasons.append(f"slechts {m['n_oos']} out-of-sample dagen (min. {MIN_OOS})")
-        if m["eff_n"] < MIN_EFF_N:
-            reasons.append(f"effectief ~{m['eff_n']:.0f} onafhankelijke metingen (min. {MIN_EFF_N})")
-        if not (m["auc"] >= min_auc):
-            reasons.append(f"OOS AUC {m['auc']:.2f} onder drempel {min_auc:.2f}")
-        if not (m["brier"] < m["brier_base"]):
-            reasons.append("Brier-score niet beter dan de naieve basislijn")
-    validated = not reasons
-
-    if p >= p_strong and agree >= 1.0:
-        raw = "STRONG BUY"
-    elif p >= p_buy and agree >= min_agree:
-        raw = "BUY"
-    elif p <= 0.45 and agree <= 0.25:
-        raw = "BEARISH"
-    else:
-        raw = "NEUTRAAL"
-
-    return {"signal": raw if validated else "ONVOLDOENDE BEWIJS",
-            "raw": raw, "validated": validated, "reasons": reasons}
-
-
-# ----------------------------------------------------------------------------
-# UI
-# ----------------------------------------------------------------------------
-def style_cell(val):
-    colors = {
-        "STRONG BUY": "background-color:#155724;color:white;font-weight:bold;",
-        "BUY": "background-color:#28a745;color:white;font-weight:bold;",
-        "NEUTRAAL": "background-color:#e2e3e5;color:#383d41;font-weight:bold;",
-        "BEARISH": "background-color:#f8d7da;color:#721c24;font-weight:bold;",
-        "ONVOLDOENDE BEWIJS": "background-color:#fff3cd;color:#856404;font-weight:bold;",
-    }
-    return colors.get(val, "")
-
-
-GREEN = "background-color:#28a745;color:white;font-weight:bold;"
-
-
-def style_green_buy(val):
-    """Kolom 'Ruwe neiging': groen bij BUY of STRONG BUY."""
-    return GREEN if val in ("BUY", "STRONG BUY") else ""
-
-
-def style_green_bullish(val):
-    """Kolom 'Modellen bullish (%)': groen bij alles boven 70."""
-    return GREEN if pd.notna(val) and val > 70 else ""
-
-
-def style_yellow_validated(val):
-    """Kolom 'Gevalideerd': geel als het model gevalideerd is."""
-    return "background-color:#ffe066;color:#5c4a00;font-weight:bold;" if val is True or val == True else ""
-
-
-RED = "background-color:#f8d7da;color:#721c24;font-weight:bold;"
-
-
-def style_vote(val):
-    """Stem van een indicator in de detailtabel."""
-    if val == "BULLISH":
-        return "background-color:#d4edda;color:#155724;font-weight:bold;"
-    return RED if val == "BEARISH" else ""
-
-
-def style_ind_label(val):
-    """Kolom 'Indicator-signaal' in de batchtabel."""
-    if val == "BULLISH":
-        return GREEN
-    return RED if val == "BEARISH" else ""
-
-
-def style_ind_score(val):
-    """Kolom 'Indicatorscore': groen vanaf bullish-grens, rood onder bearish-grens."""
-    if pd.isna(val):
-        return ""
-    if val >= IND_BULL:
-        return GREEN
-    return RED if val <= IND_BEAR else ""
-
-
-def style_map(styler, func, subset):
-    """Styler.map (pandas >= 2.1) of Styler.applymap (oudere pandas)."""
-    return (styler.map if hasattr(styler, "map") else styler.applymap)(func, subset=subset)
-
-
-def model_table(res: dict) -> pd.DataFrame:
-    t = res["table"].copy()
-    t["Stijgingskans"] = (t["p"] * 100).map("{:.1f}%".format)
-    t["Richting"] = np.where(t["p"] > 0.5, "BULLISH", "BEARISH")
-    t["OOS AUC"] = t["OOS AUC"].map(lambda v: "-" if pd.isna(v) else f"{v:.2f}")
-    return t[["Model", "Horizon", "Stijgingskans", "Richting", "OOS AUC"]]
-
-
-def style_direction(row):
-    if row["Richting"] == "BULLISH":
-        return ["background-color:#d4edda;color:#155724;"] * len(row)
-    return ["background-color:#f8d7da;color:#721c24;"] * len(row)
-
-
-def show_df(obj, **kw):
-    """st.dataframe over de volle breedte, werkt met oude en nieuwe Streamlit-versies."""
+    
+    results = []
+    
+    # Train traditionele modellen
+    for name, model in models.items():
+        try:
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            
+            results.append({
+                "Ticker": ticker,
+                "Model": name,
+                "Accuracy": round(accuracy_score(y_test, y_pred), 4),
+                "Precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
+                "Recall": round(recall_score(y_test, y_pred, zero_division=0), 4),
+                "F1-Score": round(f1_score(y_test, y_pred, zero_division=0), 4)
+            })
+        except Exception as e:
+            results.append({
+                "Ticker": ticker,
+                "Model": name,
+                "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
+            })
+    
+    # LSTM Model
     try:
-        st.dataframe(obj, width="stretch", **kw)
-    except Exception:
-        st.dataframe(obj, use_container_width=True, **kw)
-
-
-def show_single(res: dict, params: dict):
-    cls = classify(res, **params)
-    m = res["metrics"]
-    st.subheader(f"Analyse voor {res['ticker']}  (laatste koers: {res['last_date']})")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Kans stijging (1 week)", f"{res['p'] * 100:.1f}%")
-    c2.metric("Modellen bullish", f"{res['agree'] * 100:.0f}%")
-    c3.metric("OOS AUC (0.50 = toeval)", f"{m['auc']:.2f}" if m else "n.v.t.")
-    c4.metric("Basiskans omhoog", f"{m['base_up'] * 100:.0f}%" if m else "n.v.t.")
-
-    sig = cls["signal"]
-    if sig in ("STRONG BUY", "BUY"):
-        st.success(f"**Signaal: {sig}** - gevalideerd: de modellen waren in de walk-forward test beter dan de basislijn.")
-    elif sig == "BEARISH":
-        st.error("**Signaal: BEARISH** - lage stijgingskans en gevalideerd model.")
-    elif sig == "NEUTRAAL":
-        st.info("**Signaal: NEUTRAAL** - geen duidelijke richting (gevalideerd model).")
-    else:
-        st.warning(
-            f"**Geen betrouwbaar signaal.** Ruwe modelneiging: {cls['raw']}, maar het model is niet bewezen beter dan toeval.\n\n"
-            + "Reden: " + "; ".join(cls["reasons"]) + ".")
-
-    if m:
-        hit = f"{m['hit_bull'] * 100:.0f}% (n={m['n_bull']})" if not pd.isna(m["hit_bull"]) else "te weinig signalen"
-        st.caption(
-            f"Validatie: {m['n_oos']} out-of-sample dagen, accuracy {m['acc'] * 100:.0f}%, "
-            f"Brier {m['brier']:.3f} vs basislijn {m['brier_base']:.3f}. "
-            f"Hitrate bij kans >= 55%: {hit} vs basiskans {m['base_up'] * 100:.0f}%.")
-
-    lp = res["long_p"]
-    if lp:
-        txt = ", ".join(f"{k}: {v * 100:.0f}%" for k, v in lp.items())
-        st.caption(f"Lange termijn (indicatief, niet valideerbaar): {txt}.")
-        if all(v < 0.5 for v in lp.values()) and sig in ("STRONG BUY", "BUY"):
-            st.warning("Let op: de lange-termijnmodellen wijzen omlaag.")
-
-    ind = res.get("ind")
-    left, right = st.columns(2)
-
-    with left:
-        st.write("### AI-modellen (1 week)")
-        show_df(model_table(res).style.apply(style_direction, axis=1))
-
-    with right:
-        st.write("### Indicatoren: daytrade / swing 3-5 dagen")
-        if ind is None:
-            st.info("Indicatoren niet beschikbaar voor deze ticker.")
+        seq_length = 10
+        X_train_seq, y_train_seq = create_sequences(X_train, y_train, seq_length)
+        X_test_seq, y_test_seq = create_sequences(X_test, y_test, seq_length)
+        
+        if len(X_train_seq) < 50:  # Niet genoeg data voor LSTM
+            results.append({
+                "Ticker": ticker,
+                "Model": "LSTM",
+                "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
+            })
         else:
-            i1, i2 = st.columns(2)
-            i1.metric("Indicatorscore (0-100)", f"{ind['score']:.0f}")
-            i2.metric("Dagrange (ATR 14)", f"{ind['atr_pct']:.1f}%" if pd.notna(ind["atr_pct"]) else "n.v.t.")
-            if ind["label"] == "BULLISH":
-                st.success(f"**Indicator-signaal: BULLISH** (score >= {IND_BULL:.0f})")
-            elif ind["label"] == "BEARISH":
-                st.error(f"**Indicator-signaal: BEARISH** (score <= {IND_BEAR:.0f})")
-            else:
-                st.info("**Indicator-signaal: NEUTRAAL**")
-            tbl = pd.DataFrame(ind["rows"])
-            show_df(style_map(tbl.style, style_vote, ["Stem"]), hide_index=True)
+            # Normaliseer data
+            scaler = StandardScaler()
+            X_train_scaled = scaler.fit_transform(
+                X_train_seq.reshape(-1, X_train_seq.shape[-1])
+            ).reshape(X_train_seq.shape)
+            X_test_scaled = scaler.transform(
+                X_test_seq.reshape(-1, X_test_seq.shape[-1])
+            ).reshape(X_test_seq.shape)
+            
+            # PyTorch tensors
+            X_train_t = torch.FloatTensor(X_train_scaled)
+            y_train_t = torch.FloatTensor(y_train_seq)
+            X_test_t = torch.FloatTensor(X_test_scaled)
+            
+            train_dataset = TensorDataset(X_train_t, y_train_t)
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
+            
+            # Train LSTM
+            lstm_model = LSTMModel(input_size=len(feature_cols))
+            criterion = nn.BCELoss()
+            optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
+            
+            lstm_model.train()
+            for epoch in range(10):  # Minder epochs voor snelheid
+                for batch_X, batch_y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = lstm_model(batch_X).squeeze()
+                    loss = criterion(outputs, batch_y)
+                    loss.backward()
+                    optimizer.step()
+            
+            # Evaluate
+            lstm_model.eval()
+            with torch.no_grad():
+                lstm_preds = (lstm_model(X_test_t).squeeze().numpy() > 0.5).astype(int)
+            
+            results.append({
+                "Ticker": ticker,
+                "Model": "LSTM",
+                "Accuracy": round(accuracy_score(y_test_seq, lstm_preds), 4),
+                "Precision": round(precision_score(y_test_seq, lstm_preds, zero_division=0), 4),
+                "Recall": round(recall_score(y_test_seq, lstm_preds, zero_division=0), 4),
+                "F1-Score": round(f1_score(y_test_seq, lstm_preds, zero_division=0), 4)
+            })
+    except Exception as e:
+        results.append({
+            "Ticker": ticker,
+            "Model": "LSTM",
+            "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
+        })
+    
+    return results, None
 
-            def fmt_hist(hh):
-                if pd.isna(hh["hit"]):
-                    return f"te weinig signalen (n={hh['n']})"
-                return (f"{hh['hit'] * 100:.0f}% hoger, gem. {hh['avg']:+.2f}% (n={hh['n']}) "
-                        f"tegenover alle dagen {hh['base_hit'] * 100:.0f}% / {hh['base_avg']:+.2f}%")
+# ==========================================
+# HOOFDVERWERKING: ALLE TICKERS
+# ==========================================
+all_results = []
+successful_tickers = 0
+failed_tickers = []
 
-            st.caption(
-                f"Historisch bij score >= {IND_BULL:.0f} (vaste regels, niet gefit; opeenvolgende dagen overlappen): "
-                f"na 3 dagen {fmt_hist(ind['hist'][3])}; na 5 dagen {fmt_hist(ind['hist'][5])}. "
-                "De score vat de indicatoren samen en is geen voorspelling.")
+for idx, ticker in enumerate(TICKERS, 1):
+    print(f"[{idx}/{len(TICKERS)}] Verwerken {ticker}...", end=" ")
+    
+    try:
+        # Haal data op voor deze ticker
+        if isinstance(close_data, pd.DataFrame) and ticker in close_data.columns:
+            df_close = close_data[ticker].dropna()
+            df_volume = volume_data[ticker].dropna() if ticker in volume_data.columns else pd.Series(0, index=df_close.index)
+        else:
+            df_close = close_data['Close'].dropna()
+            df_volume = volume_data['Volume'].dropna()
+        
+        # Maak features
+        df = create_features(df_close, df_volume)
+        
+        # Train modellen
+        results, error = train_all_models(df, ticker)
+        
+        if error:
+            print(f"⚠️  {error}")
+            failed_tickers.append(ticker)
+        else:
+            all_results.extend(results)
+            successful_tickers += 1
+            print(f"✅ Voltooid")
+            
+    except Exception as e:
+        print(f"❌ Fout: {str(e)[:50]}")
+        failed_tickers.append(ticker)
 
+# ==========================================
+# RESULTATEN PRESENTEREN
+# ==========================================
+print("\n" + "="*80)
+print("📈 SAMENVATTING RESULTATEN")
+print("="*80)
+print(f"✅ Succesvol verwerkt: {successful_tickers}/{len(TICKERS)} tickers")
+if failed_tickers:
+    print(f"⚠️  Mislukt: {', '.join(failed_tickers)}")
 
-def main():
-    st.set_page_config(page_title="AI Stock Analyzer v2", layout="wide")
-    st.title("AI & ML Trading Analyzer v2")
-    st.caption("Signalen worden alleen als betrouwbaar getoond na een out-of-sample validatie. Geen financieel advies.")
+# Maak DataFrame van alle resultaten
+results_df = pd.DataFrame(all_results)
 
-    st.sidebar.header("Instellingen")
-    period = st.sidebar.selectbox("Koershistorie", ["5y", "10y", "max"], index=1)
-    n_blocks = st.sidebar.slider("Validatieblokken (21 dagen elk)", 5, 12, 8)
-    with st.sidebar.expander("Signaaldrempels"):
-        p_buy = st.slider("BUY vanaf kans", 0.50, 0.70, 0.55, 0.01)
-        p_strong = st.slider("STRONG BUY vanaf kans", 0.55, 0.80, 0.62, 0.01)
-        min_agree = st.slider("Min. aandeel modellen bullish (BUY)", 0.50, 1.00, 0.75, 0.25)
-        min_auc = st.slider("Min. OOS AUC voor 'gevalideerd'", 0.50, 0.65, 0.55, 0.01)
-    params = dict(p_buy=p_buy, p_strong=p_strong, min_agree=min_agree, min_auc=min_auc)
+# Gemiddelde performance per model (over alle aandelen)
+print("\n📊 Gemiddelde Performance per Model (alle aandelen):")
+print("-" * 80)
+avg_results = results_df.groupby('Model').agg({
+    'Accuracy': 'mean',
+    'Precision': 'mean',
+    'Recall': 'mean',
+    'F1-Score': 'mean'
+}).round(4)
+print(avg_results.to_string())
 
-    tab1, tab2 = st.tabs(["Enkele analyse", "Batch"])
+# Top performers per aandeel
+print("\n🏆 Beste Model per Aandeel (op basis van F1-Score):")
+print("-" * 80)
+best_per_ticker = results_df.loc[results_df.groupby('Ticker')['F1-Score'].idxmax()]
+print(best_per_ticker[['Ticker', 'Model', 'Accuracy', 'F1-Score']].to_string(index=False))
 
-    with tab1:
-        ticker = st.text_input("Ticker:", value="NVDA").strip().upper()
-        if st.button("Start analyse"):
-            with st.spinner(f"Data ophalen en modellen valideren voor {ticker}..."):
-                try:
-                    st.session_state["single"] = analyze_ticker(ticker, period, n_blocks)
-                except Exception as e:
-                    st.session_state["single"] = {"error": str(e), "ticker": ticker}
-        res = st.session_state.get("single")
-        if res:
-            if "error" in res:
-                st.error(f"Fout bij {res['ticker']}: {res['error']}")
-            else:
-                show_single(res, params)
+# Top 10 aandelen met beste overall performance
+print("\n🌟 Top 10 Aandelen (hoogste gemiddelde F1-Score over alle modellen):")
+print("-" * 80)
+top_tickers = results_df.groupby('Ticker')['F1-Score'].mean().sort_values(ascending=False).head(10)
+for ticker, score in top_tickers.items():
+    best_model = results_df[results_df['Ticker'] == ticker].loc[
+        results_df[results_df['Ticker'] == ticker]['F1-Score'].idxmax()
+    ]
+    print(f"{ticker:6s} - F1: {score:.4f} | Beste model: {best_model['Model']} ({best_model['F1-Score']:.4f})")
 
-    with tab2:
-        st.caption("Tickers gescheiden door komma, spatie of nieuwe regel (max. 510). "
-                   "Elke ticker duurt ca. 5-20 seconden; resultaten worden een uur gecached.")
-        batch_input = st.text_area("Tickers:", value="NVDA, AAPL, MSFT, AMZN, GOOGL, TSLA, META", height=100)
-        if st.button("Start batch analyse"):
-            raw = batch_input.replace(",", " ").split()
-            tickers = list(dict.fromkeys(t.strip().upper() for t in raw if t.strip()))
-            if len(tickers) > 510:
-                st.warning(f"{len(tickers)} tickers ingevoerd; ingekort tot 510.")
-                tickers = tickers[:510]
-            if not tickers:
-                st.error("Geen geldige tickers ingevoerd.")
-            else:
-                results, bar, status = {}, st.progress(0.0), st.empty()
-                for i, t in enumerate(tickers):
-                    status.text(f"Verwerken: {t} ({i + 1}/{len(tickers)})")
-                    try:
-                        results[t] = analyze_ticker(t, period, n_blocks)
-                    except Exception as e:
-                        results[t] = {"error": str(e)[:200], "ticker": t}
-                    bar.progress((i + 1) / len(tickers))
-                    time.sleep(0.2)  # vriendelijk voor Yahoo
-                status.text("Batch afgerond.")
-                st.session_state["batch"] = results
-
-        batch = st.session_state.get("batch")
-        if batch:
-            rows = []
-            for t, r in batch.items():
-                if "error" in r:
-                    rows.append({"Ticker": t, "Signaal": "FOUT", "Ruwe neiging": "-",
-                                 "Kans (%)": np.nan, "Modellen bullish (%)": np.nan,
-                                 "OOS AUC": np.nan, "Gevalideerd": False,
-                                 "Indicatorscore": np.nan, "Indicator-signaal": "-", "ATR (%)": np.nan,
-                                 "Opmerking": r["error"]})
-                    continue
-                c = classify(r, **params)
-                m = r["metrics"]
-                ind = r.get("ind")
-                rows.append({"Ticker": t, "Signaal": c["signal"], "Ruwe neiging": c["raw"],
-                             "Kans (%)": r["p"] * 100, "Modellen bullish (%)": r["agree"] * 100,
-                             "OOS AUC": m["auc"] if m else np.nan,
-                             "Gevalideerd": c["validated"],
-                             "Indicatorscore": ind["score"] if ind else np.nan,
-                             "Indicator-signaal": ind["label"] if ind else "-",
-                             "ATR (%)": ind["atr_pct"] if ind else np.nan,
-                             "Opmerking": "; ".join(c["reasons"])})
-            sdf = pd.DataFrame(rows).sort_values(["Gevalideerd", "Kans (%)"], ascending=[False, False])
-            st.subheader("Batchoverzicht")
-            styler = sdf.style
-            styler = style_map(styler, style_cell, ["Signaal"])
-            styler = style_map(styler, style_green_buy, ["Ruwe neiging"])
-            styler = style_map(styler, style_green_bullish, ["Modellen bullish (%)"])
-            styler = style_map(styler, style_yellow_validated, ["Gevalideerd"])
-            styler = style_map(styler, style_ind_score, ["Indicatorscore"])
-            styler = style_map(styler, style_ind_label, ["Indicator-signaal"])
-            styler = styler.format({"Kans (%)": "{:.1f}", "Modellen bullish (%)": "{:.0f}", "OOS AUC": "{:.2f}",
-                                    "Indicatorscore": "{:.0f}", "ATR (%)": "{:.1f}"}, na_rep="-")
-            show_df(styler)
-            st.download_button("Download als CSV", sdf.to_csv(index=False).encode("utf-8"),
-                               file_name="batch_resultaten.csv", mime="text/csv")
-
-            st.subheader("Details per aandeel (eerste 100)")
-            shown = [t for t in sdf["Ticker"] if "error" not in batch[t]][:100]
-            for t in shown:
-                with st.expander(t):
-                    show_df(model_table(batch[t]).style.apply(style_direction, axis=1))
-
-
-if __name__ == "__main__":
-    main()
+# ==========================================
+# OPSLAAN NAAR CSV
+# ==========================================
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+filename = f"stock_predictions_{timestamp}.csv"
+results_df.to_csv(filename, index=False)
+print(f"\n💾 Alle resultaten opgeslagen in: {filename}")
+print("="*80)
