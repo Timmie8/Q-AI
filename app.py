@@ -322,6 +322,24 @@ def style_cell(val):
     return colors.get(val, "")
 
 
+GREEN = "background-color:#28a745;color:white;font-weight:bold;"
+
+
+def style_green_buy(val):
+    """Kolom 'Ruwe neiging': groen bij BUY of STRONG BUY."""
+    return GREEN if val in ("BUY", "STRONG BUY") else ""
+
+
+def style_green_bullish(val):
+    """Kolom 'Modellen bullish (%)': groen bij alles boven 70."""
+    return GREEN if pd.notna(val) and val > 70 else ""
+
+
+def style_map(styler, func, subset):
+    """Styler.map (pandas >= 2.1) of Styler.applymap (oudere pandas)."""
+    return (styler.map if hasattr(styler, "map") else styler.applymap)(func, subset=subset)
+
+
 def model_table(res: dict) -> pd.DataFrame:
     t = res["table"].copy()
     t["Stijgingskans"] = (t["p"] * 100).map("{:.1f}%".format)
@@ -452,7 +470,9 @@ def main():
             sdf = pd.DataFrame(rows).sort_values(["Gevalideerd", "Kans (%)"], ascending=[False, False])
             st.subheader("Batchoverzicht")
             styler = sdf.style
-            styler = (styler.map if hasattr(styler, "map") else styler.applymap)(style_cell, subset=["Signaal"])
+            styler = style_map(styler, style_cell, ["Signaal"])
+            styler = style_map(styler, style_green_buy, ["Ruwe neiging"])
+            styler = style_map(styler, style_green_bullish, ["Modellen bullish (%)"])
             styler = styler.format({"Kans (%)": "{:.1f}", "Modellen bullish (%)": "{:.0f}", "OOS AUC": "{:.2f}"}, na_rep="-")
             st.dataframe(styler, use_container_width=True)
             st.download_button("Download als CSV", sdf.to_csv(index=False).encode("utf-8"),
