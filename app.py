@@ -13,7 +13,7 @@ import lightgbm as lgb
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
 
-# Probeer Plotly te importeren (optioneel)
+# Probeer Plotly te importeren
 try:
     import plotly.express as px
     import plotly.graph_objects as go
@@ -344,11 +344,58 @@ if start_button:
     progress_bar.progress(1.0)
     status_text.text("✅ Analyse voltooid!")
     
+    # ==========================================
+    # OVERZICHTSPAGINA: ALLE TICKERS
+    # ==========================================
     if ticker_data:
         st.success(f"✅ Succesvol verwerkt: {len(ticker_data)} tickers")
+        st.markdown("---")
         
+        # Maak overzichtstabel
+        overview_data = []
+        for ticker, data in ticker_data.items():
+            if data['ensemble']:
+                confidence = data['ensemble']['confidence']
+                direction = "📈 OMHOOG" if confidence > 0.5 else "📉 OMLAAG"
+                
+                # Bereken gemiddelde F1 van alle modellen
+                results_df = pd.DataFrame(data['results'])
+                avg_f1 = results_df['F1-Score'].mean()
+                
+                # Beste model
+                best_model_row = results_df.loc[results_df['F1-Score'].idxmax()]
+                best_model = best_model_row['Model']
+                best_f1 = best_model_row['F1-Score']
+                
+                overview_data.append({
+                    'Ticker': ticker,
+                    'Richting': direction,
+                    'Confidence': f"{confidence:.1%}",
+                    'Ensemble F1': f"{data['ensemble']['f1_score']:.4f}",
+                    'Gem. Model F1': f"{avg_f1:.4f}",
+                    'Beste Model': best_model,
+                    'Beste F1': f"{best_f1:.4f}"
+                })
+        
+        overview_df = pd.DataFrame(overview_data)
+        
+        # Sorteer op confidence
+        overview_df['Confidence_Num'] = overview_df['Confidence'].str.rstrip('%').astype(float) / 100
+        overview_df = overview_df.sort_values('Confidence_Num', ascending=False)
+        overview_df = overview_df.drop('Confidence_Num', axis=1)
+        
+        st.subheader("📋 Overzicht Alle Tickers")
+        st.markdown("**Klik op een ticker voor gedetailleerde informatie**")
+        
+        # Toon overzichtstabel
+        st.dataframe(overview_df, use_container_width=True, height=400)
+        
+        # ==========================================
+        # TICKER SELECTIE VOOR DETAILS
+        # ==========================================
+        st.markdown("---")
         selected_ticker = st.selectbox(
-            "🎯 Klik op een ticker om alle modellen te zien:",
+            "🎯 Selecteer een ticker voor gedetailleerde analyse:",
             options=list(ticker_data.keys()),
             index=0
         )
@@ -357,6 +404,9 @@ if start_button:
             data = ticker_data[selected_ticker]
             results_df = pd.DataFrame(data['results'])
             
+            # ==========================================
+            # ENSEMBLE VOORSPELLING (BOVENAAN)
+            # ==========================================
             if data['ensemble']:
                 st.markdown("---")
                 st.subheader(f"🎯 Ensemble Voorspelling voor {selected_ticker}")
@@ -385,6 +435,9 @@ if start_button:
             
             st.markdown("---")
             
+            # ==========================================
+            # ALLE MODELLEN MET SCORES
+            # ==========================================
             st.subheader(f"📊 Alle Modellen voor {selected_ticker}")
             
             results_df_sorted = results_df.sort_values('F1-Score', ascending=False)
@@ -399,6 +452,9 @@ if start_button:
             styled_df = results_df_sorted.style.apply(highlight_weights, axis=1)
             st.dataframe(styled_df, use_container_width=True, height=400)
             
+            # ==========================================
+            # VISUALISATIES
+            # ==========================================
             col1, col2 = st.columns(2)
             
             with col1:
@@ -416,7 +472,6 @@ if start_button:
                     fig.update_layout(height=400)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    # Fallback naar Streamlit bar chart
                     chart_data = results_df_sorted.set_index('Model')[['F1-Score']]
                     st.bar_chart(chart_data)
             
@@ -434,9 +489,11 @@ if start_button:
                     fig.update_layout(height=400)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    # Fallback naar Streamlit
                     st.dataframe(weights_df, use_container_width=True)
             
+            # ==========================================
+            # LSTM PATROONHERKENNING
+            # ==========================================
             st.markdown("---")
             st.subheader("🧠 LSTM Patroonherkenning")
             
@@ -465,6 +522,9 @@ if start_button:
                 modellen missen.
                 """)
             
+            # ==========================================
+            # KOERSGRAFIEK
+            # ==========================================
             st.markdown("---")
             st.subheader(f"📈 {selected_ticker} Koersverloop")
             
@@ -491,9 +551,11 @@ if start_button:
                 
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                # Fallback naar Streamlit line chart
                 st.line_chart(close_data)
             
+            # ==========================================
+            # DOWNLOAD
+            # ==========================================
             csv = results_df.to_csv(index=False).encode('utf-8')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
