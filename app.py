@@ -12,8 +12,14 @@ import xgboost as xgb
 import lightgbm as lgb
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
-import plotly.express as px
-import plotly.graph_objects as go
+
+# Probeer Plotly te importeren (optioneel)
+try:
+    import plotly.express as px
+    import plotly.graph_objects as go
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
 
 # Probeer PyTorch te importeren
 try:
@@ -33,11 +39,13 @@ st.set_page_config(page_title="Stock ML Predictor - Weighted Ensemble", layout="
 st.title("📈 Stock ML Predictor - Weighted Ensemble")
 st.markdown("**XGBoost & LightGBM wegen 3x zwaarder** | **LSTM voor patroonherkenning**")
 
+if not PLOTLY_AVAILABLE:
+    st.warning("⚠️ Plotly niet beschikbaar. Voeg 'plotly' toe aan requirements.txt voor interactieve grafieken.")
+
 # Sidebar configuratie
 with st.sidebar:
     st.header("⚙️ Configuratie")
     
-    # Ticker selectie
     default_tickers = "AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA,AMD,INTC,JPM,BAC,GS,V,MA,JNJ,UNH,PFE,WMT,COST"
     ticker_input = st.text_area(
         "Voer tickers in (gescheiden door komma's):",
@@ -45,7 +53,6 @@ with st.sidebar:
         height=150
     )
     
-    # Periode selectie
     period_options = {
         "1 jaar": "1y",
         "2 jaar": "2y",
@@ -54,11 +61,9 @@ with st.sidebar:
     selected_period = st.selectbox("Selecteer periode:", list(period_options.keys()))
     period = period_options[selected_period]
     
-    # Ensemble weights
     st.subheader("⚖️ Ensemble Weights")
     st.info("XGBoost en LightGBM wegen 3x zwaarder in de finale voorspelling")
     
-    # Start knop
     start_button = st.button("🚀 Start Analyse", type="primary", use_container_width=True)
 
 # ==========================================
@@ -126,16 +131,15 @@ def train_all_models(df, ticker, use_lstm=True):
     X_train, y_train = train_df[feature_cols], train_df['Target']
     X_test, y_test = test_df[feature_cols], test_df['Target']
     
-    # Ensemble weights: XGBoost en LightGBM wegen 3x
     model_weights = {
         "Logistic Regression": 1,
         "SVM": 1,
         "Random Forest": 1,
         "Gradient Boosting": 1,
-        "XGBoost": 3,  # ⚖️ 3x gewicht
-        "LightGBM": 3,  # ⚖️ 3x gewicht
+        "XGBoost": 3,
+        "LightGBM": 3,
         "MLP": 1,
-        "LSTM": 2  # LSTM weegt 2x (patroonherkenner)
+        "LSTM": 2
     }
     
     models = {
@@ -153,7 +157,6 @@ def train_all_models(df, ticker, use_lstm=True):
     results = []
     model_predictions = {}
     
-    # Train traditionele modellen
     for name, model in models.items():
         try:
             model.fit(X_train, y_train)
@@ -170,7 +173,6 @@ def train_all_models(df, ticker, use_lstm=True):
                 "F1-Score": round(f1_score(y_test, y_pred, zero_division=0), 4)
             })
             
-            # Bewaar voorspellingen voor ensemble
             model_predictions[name] = {
                 'pred': y_pred,
                 'prob': y_prob,
@@ -185,7 +187,6 @@ def train_all_models(df, ticker, use_lstm=True):
                 "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
             })
     
-    # LSTM Model
     lstm_prob = None
     if use_lstm and PYTORCH_AVAILABLE:
         try:
@@ -251,7 +252,6 @@ def train_all_models(df, ticker, use_lstm=True):
                 "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
             })
     
-    # Bereken ensemble voorspelling (gewogen gemiddelde)
     ensemble_prediction = None
     if model_predictions:
         weighted_sum = 0
@@ -261,9 +261,7 @@ def train_all_models(df, ticker, use_lstm=True):
             weight = pred_data['weight']
             probs = pred_data['prob']
             
-            # Alleen gebruiken als lengte overeenkomt
             if lstm_prob is not None and model_name == "LSTM":
-                # LSTM heeft andere lengte door sequence, skip in ensemble
                 continue
             
             weighted_sum += probs * weight
@@ -273,8 +271,6 @@ def train_all_models(df, ticker, use_lstm=True):
             ensemble_probs = weighted_sum / total_weight
             ensemble_preds = (ensemble_probs > 0.5).astype(int)
             
-            # Bereken ensemble metrics
-            # Gebruik de laatste test data (niet LSTM sequence data)
             ensemble_acc = accuracy_score(y_test, ensemble_preds)
             ensemble_f1 = f1_score(y_test, ensemble_preds, zero_division=0)
             
@@ -301,7 +297,6 @@ if start_button:
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Data ophalen
     status_text.text("📥 Data ophalen...")
     try:
         all_data = yf.download(tickers, period=period, progress=False, threads=True)
@@ -317,9 +312,8 @@ if start_button:
         st.error(f"❌ Fout bij ophalen data: {e}")
         st.stop()
     
-    # Verwerk elke ticker
     all_results = []
-    ticker_data = {}  # Bewaar data per ticker voor interactieve selectie
+    ticker_data = {}
     
     for idx, ticker in enumerate(tickers, 1):
         status_text.text(f"[{idx}/{len(tickers)}] Verwerken {ticker}...")
@@ -350,13 +344,9 @@ if start_button:
     progress_bar.progress(1.0)
     status_text.text("✅ Analyse voltooid!")
     
-    # ==========================================
-    # INTERACTIEVE TICKER SELECTIE
-    # ==========================================
     if ticker_data:
         st.success(f"✅ Succesvol verwerkt: {len(ticker_data)} tickers")
         
-        # Ticker selector
         selected_ticker = st.selectbox(
             "🎯 Klik op een ticker om alle modellen te zien:",
             options=list(ticker_data.keys()),
@@ -367,9 +357,6 @@ if start_button:
             data = ticker_data[selected_ticker]
             results_df = pd.DataFrame(data['results'])
             
-            # ==========================================
-            # ENSEMBLE VOORSPELLING (BOVENAAN)
-            # ==========================================
             if data['ensemble']:
                 st.markdown("---")
                 st.subheader(f"🎯 Ensemble Voorspelling voor {selected_ticker}")
@@ -387,7 +374,6 @@ if start_button:
                 with col3:
                     st.metric("Ensemble F1-Score", f"{data['ensemble']['f1_score']:.4f}")
                 
-                # Confidence bar
                 st.progress(confidence)
                 
                 st.markdown(f"""
@@ -399,15 +385,10 @@ if start_button:
             
             st.markdown("---")
             
-            # ==========================================
-            # ALLE MODELLEN MET SCORES
-            # ==========================================
             st.subheader(f"📊 Alle Modellen voor {selected_ticker}")
             
-            # Sorteer op F1-Score
             results_df_sorted = results_df.sort_values('F1-Score', ascending=False)
             
-            # Kleur coding voor weights
             def highlight_weights(row):
                 if row['Model'] in ['XGBoost', 'LightGBM']:
                     return ['background-color: #ff6b6b; color: white'] * len(row)
@@ -418,41 +399,44 @@ if start_button:
             styled_df = results_df_sorted.style.apply(highlight_weights, axis=1)
             st.dataframe(styled_df, use_container_width=True, height=400)
             
-            # ==========================================
-            # VISUALISATIES
-            # ==========================================
             col1, col2 = st.columns(2)
             
             with col1:
                 st.subheader("📊 F1-Score per Model")
-                fig = px.bar(
-                    results_df_sorted, 
-                    x='F1-Score', 
-                    y='Model', 
-                    orientation='h',
-                    color='Weight',
-                    color_continuous_scale='RdYlGn',
-                    title=f"F1-Score per Model (Hoger = Beter)"
-                )
-                fig.update_layout(height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                if PLOTLY_AVAILABLE:
+                    fig = px.bar(
+                        results_df_sorted, 
+                        x='F1-Score', 
+                        y='Model', 
+                        orientation='h',
+                        color='Weight',
+                        color_continuous_scale='RdYlGn',
+                        title=f"F1-Score per Model (Hoger = Beter)"
+                    )
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    # Fallback naar Streamlit bar chart
+                    chart_data = results_df_sorted.set_index('Model')[['F1-Score']]
+                    st.bar_chart(chart_data)
             
             with col2:
                 st.subheader("⚖️ Model Weights")
                 weights_df = results_df_sorted[['Model', 'Weight']].drop_duplicates()
-                fig = px.pie(
-                    weights_df, 
-                    values='Weight', 
-                    names='Model',
-                    title="Gewichten in Ensemble",
-                    color_discrete_sequence=px.colors.qualitative.Set3
-                )
-                fig.update_layout(height=400)
-                st.plotly_chart(fig, use_container_width=True)
+                if PLOTLY_AVAILABLE:
+                    fig = px.pie(
+                        weights_df, 
+                        values='Weight', 
+                        names='Model',
+                        title="Gewichten in Ensemble",
+                        color_discrete_sequence=px.colors.qualitative.Set3
+                    )
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    # Fallback naar Streamlit
+                    st.dataframe(weights_df, use_container_width=True)
             
-            # ==========================================
-            # LSTM PATROONHERKENNING
-            # ==========================================
             st.markdown("---")
             st.subheader("🧠 LSTM Patroonherkenning")
             
@@ -481,36 +465,35 @@ if start_button:
                 modellen missen.
                 """)
             
-            # ==========================================
-            # KOERSGRAFIEK
-            # ==========================================
             st.markdown("---")
             st.subheader(f"📈 {selected_ticker} Koersverloop")
             
             close_data = data['close_data']
-            fig = go.Figure()
             
-            fig.add_trace(go.Scatter(
-                x=close_data.index,
-                y=close_data.values,
-                mode='lines',
-                name='Close Price',
-                line=dict(color='#00d4aa', width=2)
-            ))
+            if PLOTLY_AVAILABLE:
+                fig = go.Figure()
+                
+                fig.add_trace(go.Scatter(
+                    x=close_data.index,
+                    y=close_data.values,
+                    mode='lines',
+                    name='Close Price',
+                    line=dict(color='#00d4aa', width=2)
+                ))
+                
+                fig.update_layout(
+                    title=f"{selected_ticker} - Laatste {len(close_data)} dagen",
+                    xaxis_title="Datum",
+                    yaxis_title="Prijs ($)",
+                    height=400,
+                    hovermode='x unified'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                # Fallback naar Streamlit line chart
+                st.line_chart(close_data)
             
-            fig.update_layout(
-                title=f"{selected_ticker} - Laatste {len(close_data)} dagen",
-                xaxis_title="Datum",
-                yaxis_title="Prijs ($)",
-                height=400,
-                hovermode='x unified'
-            )
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # ==========================================
-            # DOWNLOAD
-            # ==========================================
             csv = results_df.to_csv(index=False).encode('utf-8')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
