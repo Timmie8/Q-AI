@@ -212,6 +212,113 @@ def oos_metrics(oos: pd.DataFrame, names: list, horizon: int) -> dict:
 
 
 # ----------------------------------------------------------------------------
+# Indicatorscore voor daytrade / korte swingtrade (3-5 dagen)
+# Regelgebaseerd (niet gefit): elke indicator stemt +1 / 0 / -1.
+# ----------------------------------------------------------------------------
+IND_BULL, IND_BEAR = 65.0, 35.0
+
+
+def ind_label(score: float) -> str:
+    if score >= IND_BULL:
+        return "BULLISH"
+    if score <= IND_BEAR:
+        return "BEARISH"
+    return "NEUTRAAL"
+
+
+def compute_indicators(df: pd.DataFrame):
+    c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+    sma10, sma20, sma50 = (c.rolling(n).mean() for n in (10, 20, 50))
+
+    ema12 = c.ewm(span=12, adjust=False).mean()
+    ema26 = c.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    macd_hist = (macd - macd.ewm(span=9, adjust=False).mean()) / c * 100
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    rsi = 100 - 100 / (1 + gain / loss)
+
+    low14, high14 = l.rolling(14).min(), h.rolling(14).max()
+    stoch = ((c - low14) / (high14 - low14).replace(0, np.nan) * 100).rolling(3).mean()
+
+    bb_std = c.rolling(20).std()
+    pctb = (c - (sma20 - 2 * bb_std)) / (4 * bb_std).replace(0, np.nan)
+
+    roc3 = c.pct_change(3) * 100
+    vol_ratio = v / v.rolling(20).mean().replace(0, np.nan)
+    day_ret = c.pct_change()
+
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    atr_pct = tr.rolling(14).mean() / c * 100
+
+    def vote(ref, up, down):
+        out = up.astype(float) - down.astype(float)
+        out[ref.isna()] = np.nan
+        return out
+
+    spec = [
+        ("Koers vs SMA10", np.sign(c - sma10), (c / sma10 - 1) * 100, "{:+.1f}%"),
+        ("SMA10 vs SMA20", np.sign(sma10 - sma20), (sma10 / sma20 - 1) * 100, "{:+.1f}%"),
+        ("Koers vs SMA50", np.sign(c - sma50), (c / sma50 - 1) * 100, "{:+.1f}%"),
+        ("MACD-histogram", np.sign(macd_hist), macd_hist, "{:+.2f}%"),
+        ("RSI(14) momentum", vote(rsi, rsi > 55, rsi < 45), rsi, "{:.0f}"),
+        ("3-daags momentum", np.sign(roc3), roc3, "{:+.1f}%"),
+        ("Stochastic (oversold/overbought)", vote(stoch, stoch < 20, stoch > 80), stoch, "{:.0f}"),
+        ("Bollinger %B (terugval/uitputting)", vote(pctb, pctb < 0.1, pctb > 0.9), pctb, "{:.2f}"),
+        ("Volume-bevestiging",
+         vote(vol_ratio, (vol_ratio > 1.2) & (day_ret > 0), (vol_ratio > 1.2) & (day_ret < 0)),
+         vol_ratio, "{:.1f}x"),
+    ]
+    votes = pd.DataFrame({n: s for n, s, _, _ in spec}).replace([np.inf, -np.inf], np.nan)
+    values = pd.DataFrame({n: x for n, _, x, _ in spec})
+    fmts = {n: f for n, _, _, f in spec}
+    return votes, values, fmts, atr_pct
+
+
+def indicator_summary(df: pd.DataFrame):
+    votes, values, fmts, atr_pct = compute_indicators(df)
+    valid = votes.dropna()
+    if valid.empty or valid.index[-1] != df.index[-1]:
+        return None
+    n = votes.shape[1]
+    score_s = (valid.sum(axis=1) + n) / (2 * n) * 100
+    last = valid.index[-1]
+    names = {1.0: "BULLISH", -1.0: "BEARISH", 0.0: "NEUTRAAL"}
+
+    rows = []
+    for col in votes.columns:
+        val = values.at[last, col]
+        rows.append({"Indicator": col,
+                     "Waarde": fmts[col].format(val) if pd.notna(val) else "-",
+                     "Stem": names[float(valid.at[last, col])]})
+
+    # Historische check van de vaste regels: wat gebeurde er na een hoge score?
+    close = df["Close"]
+    hist = {}
+    for hz in (3, 5):
+        fwd = close.shift(-hz) / close - 1
+        s = score_s.reindex(close.index)
+        known = fwd.notna() & s.notna()
+        sel = known & (s >= IND_BULL)
+        enough = sel.sum() >= 20
+        hist[hz] = {
+            "n": int(sel.sum()),
+            "hit": float((fwd[sel] > 0).mean()) if enough else np.nan,
+            "avg": float(fwd[sel].mean() * 100) if enough else np.nan,
+            "base_hit": float((fwd[known] > 0).mean()),
+            "base_avg": float(fwd[known].mean() * 100),
+        }
+
+    score = float(score_s.iloc[-1])
+    atr = atr_pct.iloc[-1]
+    return {"score": score, "label": ind_label(score), "rows": rows,
+            "atr_pct": float(atr) if pd.notna(atr) else np.nan, "hist": hist}
+
+
+# ----------------------------------------------------------------------------
 # Analyse (zwaar -> gecached) en classificatie (licht)
 # ----------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -274,6 +381,7 @@ def analyze_ticker(ticker: str, period: str, n_blocks: int) -> dict:
         "metrics": metrics,
         "long_p": long_p,
         "n_train": int(len(Xl)),
+        "ind": indicator_summary(df),
     }
 
 
@@ -340,6 +448,32 @@ def style_yellow_validated(val):
     return "background-color:#ffe066;color:#5c4a00;font-weight:bold;" if val is True or val == True else ""
 
 
+RED = "background-color:#f8d7da;color:#721c24;font-weight:bold;"
+
+
+def style_vote(val):
+    """Stem van een indicator in de detailtabel."""
+    if val == "BULLISH":
+        return "background-color:#d4edda;color:#155724;font-weight:bold;"
+    return RED if val == "BEARISH" else ""
+
+
+def style_ind_label(val):
+    """Kolom 'Indicator-signaal' in de batchtabel."""
+    if val == "BULLISH":
+        return GREEN
+    return RED if val == "BEARISH" else ""
+
+
+def style_ind_score(val):
+    """Kolom 'Indicatorscore': groen vanaf bullish-grens, rood onder bearish-grens."""
+    if pd.isna(val):
+        return ""
+    if val >= IND_BULL:
+        return GREEN
+    return RED if val <= IND_BEAR else ""
+
+
 def style_map(styler, func, subset):
     """Styler.map (pandas >= 2.1) of Styler.applymap (oudere pandas)."""
     return (styler.map if hasattr(styler, "map") else styler.applymap)(func, subset=subset)
@@ -357,6 +491,14 @@ def style_direction(row):
     if row["Richting"] == "BULLISH":
         return ["background-color:#d4edda;color:#155724;"] * len(row)
     return ["background-color:#f8d7da;color:#721c24;"] * len(row)
+
+
+def show_df(obj, **kw):
+    """st.dataframe over de volle breedte, werkt met oude en nieuwe Streamlit-versies."""
+    try:
+        st.dataframe(obj, width="stretch", **kw)
+    except Exception:
+        st.dataframe(obj, use_container_width=True, **kw)
 
 
 def show_single(res: dict, params: dict):
@@ -396,8 +538,40 @@ def show_single(res: dict, params: dict):
         if all(v < 0.5 for v in lp.values()) and sig in ("STRONG BUY", "BUY"):
             st.warning("Let op: de lange-termijnmodellen wijzen omlaag.")
 
-    st.write("### Modeloverzicht")
-    st.dataframe(model_table(res).style.apply(style_direction, axis=1), use_container_width=True)
+    ind = res.get("ind")
+    left, right = st.columns(2)
+
+    with left:
+        st.write("### AI-modellen (1 week)")
+        show_df(model_table(res).style.apply(style_direction, axis=1))
+
+    with right:
+        st.write("### Indicatoren: daytrade / swing 3-5 dagen")
+        if ind is None:
+            st.info("Indicatoren niet beschikbaar voor deze ticker.")
+        else:
+            i1, i2 = st.columns(2)
+            i1.metric("Indicatorscore (0-100)", f"{ind['score']:.0f}")
+            i2.metric("Dagrange (ATR 14)", f"{ind['atr_pct']:.1f}%" if pd.notna(ind["atr_pct"]) else "n.v.t.")
+            if ind["label"] == "BULLISH":
+                st.success(f"**Indicator-signaal: BULLISH** (score >= {IND_BULL:.0f})")
+            elif ind["label"] == "BEARISH":
+                st.error(f"**Indicator-signaal: BEARISH** (score <= {IND_BEAR:.0f})")
+            else:
+                st.info("**Indicator-signaal: NEUTRAAL**")
+            tbl = pd.DataFrame(ind["rows"])
+            show_df(style_map(tbl.style, style_vote, ["Stem"]), hide_index=True)
+
+            def fmt_hist(hh):
+                if pd.isna(hh["hit"]):
+                    return f"te weinig signalen (n={hh['n']})"
+                return (f"{hh['hit'] * 100:.0f}% hoger, gem. {hh['avg']:+.2f}% (n={hh['n']}) "
+                        f"tegenover alle dagen {hh['base_hit'] * 100:.0f}% / {hh['base_avg']:+.2f}%")
+
+            st.caption(
+                f"Historisch bij score >= {IND_BULL:.0f} (vaste regels, niet gefit; opeenvolgende dagen overlappen): "
+                f"na 3 dagen {fmt_hist(ind['hist'][3])}; na 5 dagen {fmt_hist(ind['hist'][5])}. "
+                "De score vat de indicatoren samen en is geen voorspelling.")
 
 
 def main():
@@ -464,14 +638,21 @@ def main():
                 if "error" in r:
                     rows.append({"Ticker": t, "Signaal": "FOUT", "Ruwe neiging": "-",
                                  "Kans (%)": np.nan, "Modellen bullish (%)": np.nan,
-                                 "OOS AUC": np.nan, "Gevalideerd": False, "Opmerking": r["error"]})
+                                 "OOS AUC": np.nan, "Gevalideerd": False,
+                                 "Indicatorscore": np.nan, "Indicator-signaal": "-", "ATR (%)": np.nan,
+                                 "Opmerking": r["error"]})
                     continue
                 c = classify(r, **params)
                 m = r["metrics"]
+                ind = r.get("ind")
                 rows.append({"Ticker": t, "Signaal": c["signal"], "Ruwe neiging": c["raw"],
                              "Kans (%)": r["p"] * 100, "Modellen bullish (%)": r["agree"] * 100,
                              "OOS AUC": m["auc"] if m else np.nan,
-                             "Gevalideerd": c["validated"], "Opmerking": "; ".join(c["reasons"])})
+                             "Gevalideerd": c["validated"],
+                             "Indicatorscore": ind["score"] if ind else np.nan,
+                             "Indicator-signaal": ind["label"] if ind else "-",
+                             "ATR (%)": ind["atr_pct"] if ind else np.nan,
+                             "Opmerking": "; ".join(c["reasons"])})
             sdf = pd.DataFrame(rows).sort_values(["Gevalideerd", "Kans (%)"], ascending=[False, False])
             st.subheader("Batchoverzicht")
             styler = sdf.style
@@ -479,8 +660,11 @@ def main():
             styler = style_map(styler, style_green_buy, ["Ruwe neiging"])
             styler = style_map(styler, style_green_bullish, ["Modellen bullish (%)"])
             styler = style_map(styler, style_yellow_validated, ["Gevalideerd"])
-            styler = styler.format({"Kans (%)": "{:.1f}", "Modellen bullish (%)": "{:.0f}", "OOS AUC": "{:.2f}"}, na_rep="-")
-            st.dataframe(styler, use_container_width=True)
+            styler = style_map(styler, style_ind_score, ["Indicatorscore"])
+            styler = style_map(styler, style_ind_label, ["Indicator-signaal"])
+            styler = styler.format({"Kans (%)": "{:.1f}", "Modellen bullish (%)": "{:.0f}", "OOS AUC": "{:.2f}",
+                                    "Indicatorscore": "{:.0f}", "ATR (%)": "{:.1f}"}, na_rep="-")
+            show_df(styler)
             st.download_button("Download als CSV", sdf.to_csv(index=False).encode("utf-8"),
                                file_name="batch_resultaten.csv", mime="text/csv")
 
@@ -488,8 +672,7 @@ def main():
             shown = [t for t in sdf["Ticker"] if "error" not in batch[t]][:100]
             for t in shown:
                 with st.expander(t):
-                    st.dataframe(model_table(batch[t]).style.apply(style_direction, axis=1),
-                                 use_container_width=True)
+                    show_df(model_table(batch[t]).style.apply(style_direction, axis=1))
 
 
 if __name__ == "__main__":
