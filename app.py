@@ -335,6 +335,11 @@ def style_green_bullish(val):
     return GREEN if pd.notna(val) and val > 70 else ""
 
 
+def style_yellow_validated(val):
+    """Kolom 'Gevalideerd': geel als het model gevalideerd is."""
+    return "background-color:#ffe066;color:#5c4a00;font-weight:bold;" if val is True or val == True else ""
+
+
 def style_map(styler, func, subset):
     """Styler.map (pandas >= 2.1) of Styler.applymap (oudere pandas)."""
     return (styler.map if hasattr(styler, "map") else styler.applymap)(func, subset=subset)
@@ -473,6 +478,7 @@ def main():
             styler = style_map(styler, style_cell, ["Signaal"])
             styler = style_map(styler, style_green_buy, ["Ruwe neiging"])
             styler = style_map(styler, style_green_bullish, ["Modellen bullish (%)"])
+            styler = style_map(styler, style_yellow_validated, ["Gevalideerd"])
             styler = styler.format({"Kans (%)": "{:.1f}", "Modellen bullish (%)": "{:.0f}", "OOS AUC": "{:.2f}"}, na_rep="-")
             st.dataframe(styler, use_container_width=True)
             st.download_button("Download als CSV", sdf.to_csv(index=False).encode("utf-8"),
