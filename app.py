@@ -35,37 +35,42 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # STREAMLIT UI
 # ==========================================
-st.set_page_config(page_title="Stock ML Predictor - Smart Signals", layout="wide")
-st.title(" Stock ML Predictor - Smart Signals")
-st.markdown("**Regel:** XGBoost/LightGBM Bullish = **BUY** | + LSTM Bullish = **STRONG BUY**")
+st.set_page_config(page_title="Stock ML Predictor - Fast", layout="wide")
+st.title("📈 Stock ML Predictor - Fast Mode")
+st.markdown("**Snelle analyse met 7 modellen** | **LSTM optioneel**")
 
 if not PLOTLY_AVAILABLE:
-    st.warning("⚠️ Plotly niet beschikbaar. Voeg 'plotly' toe aan requirements.txt voor interactieve grafieken.")
+    st.warning("⚠️ Plotly niet beschikbaar. Voeg 'plotly' toe aan requirements.txt.")
 
 if not PYTORCH_AVAILABLE:
-    st.warning("⚠️ PyTorch niet beschikbaar. Voeg 'torch' toe aan requirements.txt voor LSTM model.")
+    st.warning("⚠️ PyTorch niet beschikbaar. LSTM wordt overgeslagen.")
 
 # Sidebar configuratie
 with st.sidebar:
     st.header("⚙️ Configuratie")
     
-    default_tickers = "AAPL,MSFT,GOOGL,AMZN,META,NVDA,TSLA,AMD,INTC,JPM,BAC,GS,V,MA,JNJ,UNH,PFE,WMT,COST"
+    # ✅ MINDER TICKERS VOOR SNELLERE START
+    default_tickers = "AAPL,MSFT,GOOGL,NVDA,TSLA"
     ticker_input = st.text_area(
-        "Voer tickers in (gescheiden door komma's):",
+        "Voer tickers in (max 10 aanbevolen):",
         value=default_tickers,
-        height=150
+        height=100
     )
     
+    # ✅ KORTERE PERIODE
     period_options = {
+        "6 maanden": "6mo",
         "1 jaar": "1y",
-        "2 jaar": "2y",
-        "5 jaar": "5y"
+        "2 jaar": "2y"
     }
-    selected_period = st.selectbox("Selecteer periode:", list(period_options.keys()))
+    selected_period = st.selectbox("Selecteer periode:", list(period_options.keys()), index=0)
     period = period_options[selected_period]
     
-    st.subheader("️ Ensemble Weights")
-    st.info("XGBoost en LightGBM wegen 3x zwaarder in de finale voorspelling")
+    # ✅ LSTM OPTIONEEL (standaard uit voor snelheid)
+    use_lstm = st.checkbox("Gebruik LSTM (langzamer)", value=False)
+    
+    # ✅ MINDER COMPLEXE MODELLEN
+    fast_mode = st.checkbox("Fast Mode (minder estimators)", value=True)
     
     start_button = st.button("🚀 Start Analyse", type="primary", use_container_width=True)
 
@@ -95,13 +100,13 @@ def create_features(df_close, df_volume):
     return df.dropna()
 
 # ==========================================
-# LSTM MODEL
+# LSTM MODEL (optioneel)
 # ==========================================
 if PYTORCH_AVAILABLE:
     class LSTMModel(nn.Module):
-        def __init__(self, input_size, hidden_size=32, num_layers=2):
+        def __init__(self, input_size, hidden_size=16, num_layers=1):  # ✅ KLEINER MODEL
             super(LSTMModel, self).__init__()
-            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.2)
+            self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=0.1)
             self.fc = nn.Linear(hidden_size, 1)
             self.sigmoid = nn.Sigmoid()
 
@@ -110,7 +115,7 @@ if PYTORCH_AVAILABLE:
             out = self.fc(out[:, -1, :])
             return self.sigmoid(out)
 
-    def create_sequences(X, y, seq_length=10):
+    def create_sequences(X, y, seq_length=5):  # ✅ KORTERE SEQUENTIE
         X_seq, y_seq = [], []
         for i in range(len(X) - seq_length):
             X_seq.append(X.iloc[i:i+seq_length].values)
@@ -118,9 +123,9 @@ if PYTORCH_AVAILABLE:
         return np.array(X_seq), np.array(y_seq)
 
 # ==========================================
-# MODEL TRAINING & SIGNAL LOGIC
+# MODEL TRAINING (GEOPIMALISEERD)
 # ==========================================
-def train_all_models(df, ticker, use_lstm=True):
+def train_all_models(df, ticker, use_lstm=False, fast_mode=True):
     feature_cols = ['Return_1d', 'Return_3d', 'Return_5d', 'SMA_5', 'SMA_10', 
                     'SMA_20', 'Volatility_10', 'RSI_14']
     
@@ -134,6 +139,9 @@ def train_all_models(df, ticker, use_lstm=True):
     X_train, y_train = train_df[feature_cols], train_df['Target']
     X_test, y_test = test_df[feature_cols], test_df['Target']
     
+    # ✅ MINDER ESTIMATORS VOOR SNELLERE TRAINING
+    n_estimators = 50 if fast_mode else 100
+    
     model_weights = {
         "Logistic Regression": 1,
         "SVM": 1,
@@ -146,15 +154,15 @@ def train_all_models(df, ticker, use_lstm=True):
     }
     
     models = {
-        "Logistic Regression": LogisticRegression(max_iter=1000, random_state=42),
+        "Logistic Regression": LogisticRegression(max_iter=500, random_state=42),  # ✅ MINDER ITERATIES
         "SVM": SVC(kernel='rbf', probability=True, random_state=42),
-        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1),
-        "Gradient Boosting": GradientBoostingClassifier(n_estimators=100, random_state=42),
-        "XGBoost": xgb.XGBClassifier(n_estimators=100, learning_rate=0.1, random_state=42, 
+        "Random Forest": RandomForestClassifier(n_estimators=n_estimators, random_state=42, n_jobs=-1),
+        "Gradient Boosting": GradientBoostingClassifier(n_estimators=n_estimators, random_state=42),
+        "XGBoost": xgb.XGBClassifier(n_estimators=n_estimators, learning_rate=0.1, random_state=42, 
                                      eval_metric='logloss', verbosity=0),
-        "LightGBM": lgb.LGBMClassifier(n_estimators=100, learning_rate=0.1, random_state=42, 
+        "LightGBM": lgb.LGBMClassifier(n_estimators=n_estimators, learning_rate=0.1, random_state=42, 
                                        verbose=-1),
-        "MLP": MLPClassifier(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
+        "MLP": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=200, random_state=42)  # ✅ KLEINER NETWERK
     }
     
     results = []
@@ -190,14 +198,14 @@ def train_all_models(df, ticker, use_lstm=True):
                 "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
             })
     
-    # LSTM Model
+    # LSTM Model (optioneel)
     if use_lstm and PYTORCH_AVAILABLE:
         try:
-            seq_length = 10
+            seq_length = 5
             X_train_seq, y_train_seq = create_sequences(X_train, y_train, seq_length)
             X_test_seq, y_test_seq = create_sequences(X_test, y_test, seq_length)
             
-            if len(X_train_seq) >= 50:
+            if len(X_train_seq) >= 30:
                 scaler = StandardScaler()
                 X_train_scaled = scaler.fit_transform(
                     X_train_seq.reshape(-1, X_train_seq.shape[-1])
@@ -218,7 +226,7 @@ def train_all_models(df, ticker, use_lstm=True):
                 optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
                 
                 lstm_model.train()
-                for epoch in range(10):
+                for epoch in range(5):  # ✅ MINDER EPOCHS
                     for batch_X, batch_y in train_loader:
                         optimizer.zero_grad()
                         outputs = lstm_model(batch_X).squeeze()
@@ -254,14 +262,11 @@ def train_all_models(df, ticker, use_lstm=True):
                 "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
             })
     
-    # ==========================================
-    # 🎯 SMART SIGNAL LOGIC (Laatste voorspelling)
-    # ==========================================
+    # Signal Logic
     signal = "HOLD / SELL"
-    signal_color = "🔴"
-    signal_desc = "Geen sterke bullish signalen van XGBoost, LightGBM of LSTM."
+    signal_color = ""
+    signal_desc = "Geen sterke bullish signalen."
     
-    # Haal de ALLERLAATSTE voorspelling op (index -1) voor de meest actuele dag
     xgb_latest = model_predictions.get("XGBoost", {}).get('pred', [0])[-1]
     lgb_latest = model_predictions.get("LightGBM", {}).get('pred', [0])[-1]
     lstm_latest = model_predictions.get("LSTM", {}).get('pred', [0])[-1] if "LSTM" in model_predictions else 0
@@ -272,12 +277,12 @@ def train_all_models(df, ticker, use_lstm=True):
     
     if (xgb_bullish or lgb_bullish) and lstm_bullish:
         signal = "STRONG BUY"
-        signal_color = "🟢"
-        signal_desc = "XGBoost/LightGBM én LSTM zijn bullish. Sterkste mogelijk signaal."
+        signal_color = ""
+        signal_desc = "XGBoost/LightGBM én LSTM zijn bullish."
     elif xgb_bullish or lgb_bullish:
         signal = "BUY"
         signal_color = "🔵"
-        signal_desc = "XGBoost of LightGBM is bullish. Standaard koopsignaal."
+        signal_desc = "XGBoost of LightGBM is bullish."
     
     ensemble_prediction = {
         'signal': signal, 
@@ -288,10 +293,9 @@ def train_all_models(df, ticker, use_lstm=True):
     return results, ensemble_prediction, None
 
 # ==========================================
-# KLEURCODERING FUNCTIE
+# KLEURCODERING
 # ==========================================
 def highlight_weights(row):
-    """Kleurcodering: Groen = XGBoost/LightGBM, Blauw = LSTM"""
     if row['Model'] in ['XGBoost', 'LightGBM']:
         return ['background-color: #28a745; color: white; font-weight: bold'] * len(row)
     elif row['Model'] == 'LSTM':
@@ -299,7 +303,6 @@ def highlight_weights(row):
     return [''] * len(row)
 
 def highlight_signals(row):
-    """Kleurcodering voor overzichtstabel"""
     if "STRONG BUY" in row['Signaal']:
         return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
     elif "BUY" in row['Signaal']:
@@ -307,78 +310,81 @@ def highlight_signals(row):
     return [''] * len(row)
 
 # ==========================================
-# HOOFDLOGICA
+# HOOFDLOGICA MET BETERE FEEDBACK
 # ==========================================
 if start_button:
     tickers = [t.strip().upper() for t in ticker_input.split(',') if t.strip()]
+    
+    # ✅ WAARSCHUWING BIJ TE VEEL TICKERS
+    if len(tickers) > 10:
+        st.warning(f"⚠️ Je hebt {len(tickers)} tickers ingevoerd. Dit kan lang duren. Max 10 aanbevolen voor snelle resultaten.")
     
     if not tickers:
         st.error("❌ Geen tickers ingevoerd!")
         st.stop()
     
-    st.info(f"📊 Analyseren van {len(tickers)} tickers...")
-    
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    status_text.text("📥 Data ophalen...")
-    try:
-        all_data = yf.download(tickers, period=period, progress=False, threads=True)
+    # ✅ SPINNER VOOR FEEDBACK
+    with st.spinner(f"📊 Analyseren van {len(tickers)} tickers... Dit kan 1-3 minuten duren."):
         
-        if isinstance(all_data.columns, pd.MultiIndex):
-            close_data = all_data['Close']
-            volume_data = all_data['Volume']
-        else:
-            close_data = all_data[['Close']]
-            volume_data = all_data[['Volume']]
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         
-    except Exception as e:
-        st.error(f" Fout bij ophalen data: {e}")
-        st.stop()
-    
-    ticker_data = {}
-    
-    for idx, ticker in enumerate(tickers, 1):
-        status_text.text(f"[{idx}/{len(tickers)}] Verwerken {ticker}...")
-        progress_bar.progress(idx / len(tickers))
-        
+        status_text.text("📥 Data ophalen...")
         try:
-            if isinstance(close_data, pd.DataFrame) and ticker in close_data.columns:
-                df_close = close_data[ticker].dropna()
-                df_volume = volume_data[ticker].dropna() if ticker in volume_data.columns else pd.Series(0, index=df_close.index)
+            all_data = yf.download(tickers, period=period, progress=False, threads=True)
+            
+            if isinstance(all_data.columns, pd.MultiIndex):
+                close_data = all_data['Close']
+                volume_data = all_data['Volume']
             else:
-                continue
+                close_data = all_data[['Close']]
+                volume_data = all_data[['Volume']]
             
-            df = create_features(df_close, df_volume)
-            results, ensemble_pred, error = train_all_models(df, ticker, use_lstm=True)
-            
-            if not error and results:
-                ticker_data[ticker] = {
-                    'results': results,
-                    'ensemble': ensemble_pred,
-                    'close_data': df_close,
-                    'df': df
-                }
-                
         except Exception as e:
-            continue
-    
-    progress_bar.progress(1.0)
-    status_text.text("✅ Analyse voltooid!")
+            st.error(f"❌ Fout bij ophalen data: {e}")
+            st.stop()
+        
+        ticker_data = {}
+        
+        for idx, ticker in enumerate(tickers, 1):
+            status_text.text(f"[{idx}/{len(tickers)}] Verwerken {ticker}...")
+            progress_bar.progress(idx / len(tickers))
+            
+            try:
+                if isinstance(close_data, pd.DataFrame) and ticker in close_data.columns:
+                    df_close = close_data[ticker].dropna()
+                    df_volume = volume_data[ticker].dropna() if ticker in volume_data.columns else pd.Series(0, index=df_close.index)
+                else:
+                    continue
+                
+                df = create_features(df_close, df_volume)
+                results, ensemble_pred, error = train_all_models(df, ticker, use_lstm=use_lstm, fast_mode=fast_mode)
+                
+                if not error and results:
+                    ticker_data[ticker] = {
+                        'results': results,
+                        'ensemble': ensemble_pred,
+                        'close_data': df_close,
+                        'df': df
+                    }
+                    
+            except Exception as e:
+                continue
+        
+        progress_bar.progress(1.0)
+        status_text.text("✅ Analyse voltooid!")
     
     # ==========================================
-    # OVERZICHTSPAGINA: ALLE TICKERS
+    # OVERZICHTSPAGINA
     # ==========================================
     if ticker_data:
         st.success(f"✅ Succesvol verwerkt: {len(ticker_data)} tickers")
         st.markdown("---")
         
-        # Maak overzichtstabel
         overview_data = []
         for ticker, data in ticker_data.items():
             ens = data['ensemble']
             results_df = pd.DataFrame(data['results'])
-            avg_f1 = results_df['F1-Score'].mean()
             best_model_row = results_df.loc[results_df['F1-Score'].idxmax()]
             
             overview_data.append({
@@ -391,7 +397,6 @@ if start_button:
         
         overview_df = pd.DataFrame(overview_data)
         
-        # Sorteer: Strong Buy eerst, dan Buy, dan rest
         def signal_sort_key(row):
             if "STRONG BUY" in row['Signaal']: return 0
             if "BUY" in row['Signaal']: return 1
@@ -400,10 +405,8 @@ if start_button:
         overview_df['Sort_Key'] = overview_df.apply(signal_sort_key, axis=1)
         overview_df = overview_df.sort_values(['Sort_Key', 'Ticker']).drop('Sort_Key', axis=1)
         
-        st.subheader(" Overzicht Alle Tickers & Signalen")
-        st.markdown("**Klik op een ticker hieronder voor gedetailleerde informatie**")
+        st.subheader("📋 Overzicht Alle Tickers & Signalen")
         
-        # Legenda
         st.markdown("""
         **Legenda:**
         - 🟢 **Groen** = XGBoost & LightGBM (hoofd BUY-signalen, wegen 3x)
@@ -415,13 +418,14 @@ if start_button:
         st.dataframe(styled_overview, use_container_width=True, height=400)
         
         # ==========================================
-        # TICKER SELECTIE VOOR DETAILS
+        # TICKER SELECTIE
         # ==========================================
         st.markdown("---")
         selected_ticker = st.selectbox(
-            " Selecteer een ticker voor gedetailleerde analyse:",
+            "🎯 Selecteer een ticker voor gedetailleerde analyse:",
             options=list(ticker_data.keys()),
-            index=0
+            index=0,
+            key="ticker_selector"
         )
         
         if selected_ticker in ticker_data:
@@ -429,7 +433,6 @@ if start_button:
             results_df = pd.DataFrame(data['results'])
             ens = data['ensemble']
             
-            # Groot Signaal Blok
             st.markdown("---")
             if ens['signal'] == "STRONG BUY":
                 st.markdown(f"<h1 style='color: green; text-align: center;'>{ens['signal_color']} {ens['signal']} ({selected_ticker})</h1>", unsafe_allow_html=True)
@@ -441,12 +444,11 @@ if start_button:
             st.info(f"**Waarom?** {ens['signal_desc']}")
             
             st.markdown("---")
-            st.subheader(f" Alle Modellen voor {selected_ticker}")
+            st.subheader(f"📊 Alle Modellen voor {selected_ticker}")
             
             results_df_sorted = results_df.sort_values('F1-Score', ascending=False)
             st.dataframe(results_df_sorted.style.apply(highlight_weights, axis=1), use_container_width=True, height=400)
             
-            # Grafieken
             col1, col2 = st.columns(2)
             
             with col1:
@@ -458,11 +460,10 @@ if start_button:
                         y='Model', 
                         orientation='h',
                         color='Weight',
-                        color_continuous_scale='RdYlGn',
-                        title=f"F1-Score per Model (Hoger = Beter)"
+                        color_continuous_scale='RdYlGn'
                     )
                     fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"f1_chart_{selected_ticker}")
                 else:
                     chart_data = results_df_sorted.set_index('Model')[['F1-Score']]
                     st.bar_chart(chart_data)
@@ -475,67 +476,44 @@ if start_button:
                         weights_df, 
                         values='Weight', 
                         names='Model',
-                        title="Gewichten in Ensemble",
                         color_discrete_sequence=px.colors.qualitative.Set3
                     )
                     fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"weight_chart_{selected_ticker}")
                 else:
                     st.dataframe(weights_df, use_container_width=True)
             
-            # LSTM Patroonherkenning
-            st.markdown("---")
-            st.subheader("🧠 LSTM Patroonherkenning")
-            
-            lstm_row = results_df[results_df['Model'] == 'LSTM']
-            if not lstm_row.empty:
-                lstm_metrics = lstm_row.iloc[0]
-                
-                col1, col2, col3, col4 = st.columns(4)
-                
-                with col1:
-                    st.metric("LSTM Accuracy", f"{lstm_metrics['Accuracy']:.2%}")
-                with col2:
-                    st.metric("LSTM Precision", f"{lstm_metrics['Precision']:.2%}")
-                with col3:
-                    st.metric("LSTM Recall", f"{lstm_metrics['Recall']:.2%}")
-                with col4:
-                    st.metric("LSTM F1-Score", f"{lstm_metrics['F1-Score']:.4f}")
-                
-                st.info("""
-                **LSTM (Long Short-Term Memory)** is een recurrent neural network dat 
-                tijdsafhankelijke patronen herkent in de koersdata. Het analyseert sequenties 
-                van 10 dagen om complexe niet-lineaire patronen te detecteren die traditionele 
-                modellen missen.
-                """)
-            
-            # Koersgrafiek
             st.markdown("---")
             st.subheader(f"📈 {selected_ticker} Koersverloop")
             
             close_data = data['close_data']
             
+            if isinstance(close_data, pd.Series):
+                close_df = close_data.to_frame(name='Close')
+            else:
+                close_df = close_data
+            
             if PLOTLY_AVAILABLE:
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
-                    x=close_data.index,
-                    y=close_data.values,
+                    x=close_df.index,
+                    y=close_df['Close'].values,
                     mode='lines',
                     name='Close Price',
                     line=dict(color='#00d4aa', width=2)
                 ))
                 fig.update_layout(
-                    title=f"{selected_ticker} - Laatste {len(close_data)} dagen",
+                    title=f"{selected_ticker} - Laatste {len(close_df)} dagen",
                     xaxis_title="Datum",
                     yaxis_title="Prijs ($)",
                     height=400,
-                    hovermode='x unified'
+                    hovermode='x unified',
+                    template='plotly_white'
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True, key=f"price_chart_{selected_ticker}")
             else:
-                st.line_chart(close_data)
+                st.line_chart(close_df, use_container_width=True)
             
-            # Download
             csv = results_df.to_csv(index=False).encode('utf-8')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
