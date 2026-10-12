@@ -36,14 +36,14 @@ warnings.filterwarnings('ignore')
 # STREAMLIT UI
 # ==========================================
 st.set_page_config(page_title="Stock ML Predictor - Smart Signals", layout="wide")
-st.title(" Stock ML Predictor - Smart Signals")
+st.title("📈 Stock ML Predictor - Smart Signals")
 st.markdown("**Regel:** XGBoost/LightGBM Bullish = **BUY** | + LSTM Bullish = **STRONG BUY**")
 
 if not PLOTLY_AVAILABLE:
     st.warning("⚠️ Plotly niet beschikbaar. Voeg 'plotly' toe aan requirements.txt voor interactieve grafieken.")
 
 if not PYTORCH_AVAILABLE:
-    st.warning("⚠️ PyTorch niet beschikbaar. Voeg 'torch' toe aan requirements.txt voor LSTM model.")
+    st.warning("️ PyTorch niet beschikbaar. Voeg 'torch' toe aan requirements.txt voor LSTM model.")
 
 # Sidebar configuratie
 with st.sidebar:
@@ -333,7 +333,7 @@ if start_button:
             volume_data = all_data[['Volume']]
         
     except Exception as e:
-        st.error(f" Fout bij ophalen data: {e}")
+        st.error(f"❌ Fout bij ophalen data: {e}")
         st.stop()
     
     ticker_data = {}
@@ -419,9 +419,10 @@ if start_button:
         # ==========================================
         st.markdown("---")
         selected_ticker = st.selectbox(
-            " Selecteer een ticker voor gedetailleerde analyse:",
+            "🎯 Selecteer een ticker voor gedetailleerde analyse:",
             options=list(ticker_data.keys()),
-            index=0
+            index=0,
+            key="ticker_selector"  # ✅ Unieke key toegevoegd
         )
         
         if selected_ticker in ticker_data:
@@ -441,7 +442,7 @@ if start_button:
             st.info(f"**Waarom?** {ens['signal_desc']}")
             
             st.markdown("---")
-            st.subheader(f" Alle Modellen voor {selected_ticker}")
+            st.subheader(f"📊 Alle Modellen voor {selected_ticker}")
             
             results_df_sorted = results_df.sort_values('F1-Score', ascending=False)
             st.dataframe(results_df_sorted.style.apply(highlight_weights, axis=1), use_container_width=True, height=400)
@@ -462,13 +463,13 @@ if start_button:
                         title=f"F1-Score per Model (Hoger = Beter)"
                     )
                     fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"f1_chart_{selected_ticker}")  # ✅ Unieke key
                 else:
                     chart_data = results_df_sorted.set_index('Model')[['F1-Score']]
                     st.bar_chart(chart_data)
             
             with col2:
-                st.subheader("⚖️ Model Weights")
+                st.subheader("️ Model Weights")
                 weights_df = results_df_sorted[['Model', 'Weight']].drop_duplicates()
                 if PLOTLY_AVAILABLE:
                     fig = px.pie(
@@ -479,7 +480,7 @@ if start_button:
                         color_discrete_sequence=px.colors.qualitative.Set3
                     )
                     fig.update_layout(height=400)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True, key=f"weight_chart_{selected_ticker}")  # ✅ Unieke key
                 else:
                     st.dataframe(weights_df, use_container_width=True)
             
@@ -509,37 +510,49 @@ if start_button:
                 modellen missen.
                 """)
             
-            # Koersgrafiek
+            # Koersgrafiek - ✅ FIX: Unieke key + expliciete data conversie
             st.markdown("---")
             st.subheader(f"📈 {selected_ticker} Koersverloop")
             
             close_data = data['close_data']
             
+            # ✅ Converteer naar DataFrame om zeker te zijn dat het correct plot
+            if isinstance(close_data, pd.Series):
+                close_df = close_data.to_frame(name='Close')
+            else:
+                close_df = close_data
+            
             if PLOTLY_AVAILABLE:
+                # ✅ Maak een NIEUWE figure elke keer (geen caching)
                 fig = go.Figure()
+                
                 fig.add_trace(go.Scatter(
-                    x=close_data.index,
-                    y=close_data.values,
+                    x=close_df.index,
+                    y=close_df['Close'].values,
                     mode='lines',
                     name='Close Price',
                     line=dict(color='#00d4aa', width=2)
                 ))
+                
                 fig.update_layout(
-                    title=f"{selected_ticker} - Laatste {len(close_data)} dagen",
+                    title=f"{selected_ticker} - Laatste {len(close_df)} dagen",
                     xaxis_title="Datum",
                     yaxis_title="Prijs ($)",
                     height=400,
-                    hovermode='x unified'
+                    hovermode='x unified',
+                    template='plotly_white'  # ✅ Schone template
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                
+                # ✅ Unieke key voor elke ticker
+                st.plotly_chart(fig, use_container_width=True, key=f"price_chart_{selected_ticker}")
             else:
-                st.line_chart(close_data)
+                st.line_chart(close_df, use_container_width=True)
             
             # Download
             csv = results_df.to_csv(index=False).encode('utf-8')
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
-                label=f"📥 Download resultaten voor {selected_ticker}",
+                label=f" Download resultaten voor {selected_ticker}",
                 data=csv,
                 file_name=f"{selected_ticker}_predictions_{timestamp}.csv",
                 mime="text/csv"
