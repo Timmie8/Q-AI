@@ -36,11 +36,14 @@ warnings.filterwarnings('ignore')
 # STREAMLIT UI
 # ==========================================
 st.set_page_config(page_title="Stock ML Predictor - Smart Signals", layout="wide")
-st.title("📈 Stock ML Predictor - Smart Signals")
+st.title(" Stock ML Predictor - Smart Signals")
 st.markdown("**Regel:** XGBoost/LightGBM Bullish = **BUY** | + LSTM Bullish = **STRONG BUY**")
 
 if not PLOTLY_AVAILABLE:
     st.warning("⚠️ Plotly niet beschikbaar. Voeg 'plotly' toe aan requirements.txt voor interactieve grafieken.")
+
+if not PYTORCH_AVAILABLE:
+    st.warning("⚠️ PyTorch niet beschikbaar. Voeg 'torch' toe aan requirements.txt voor LSTM model.")
 
 # Sidebar configuratie
 with st.sidebar:
@@ -60,6 +63,9 @@ with st.sidebar:
     }
     selected_period = st.selectbox("Selecteer periode:", list(period_options.keys()))
     period = period_options[selected_period]
+    
+    st.subheader("️ Ensemble Weights")
+    st.info("XGBoost en LightGBM wegen 3x zwaarder in de finale voorspelling")
     
     start_button = st.button("🚀 Start Analyse", type="primary", use_container_width=True)
 
@@ -129,8 +135,14 @@ def train_all_models(df, ticker, use_lstm=True):
     X_test, y_test = test_df[feature_cols], test_df['Target']
     
     model_weights = {
-        "Logistic Regression": 1, "SVM": 1, "Random Forest": 1, "Gradient Boosting": 1,
-        "XGBoost": 3, "LightGBM": 3, "MLP": 1, "LSTM": 2
+        "Logistic Regression": 1,
+        "SVM": 1,
+        "Random Forest": 1,
+        "Gradient Boosting": 1,
+        "XGBoost": 3,
+        "LightGBM": 3,
+        "MLP": 1,
+        "LSTM": 2
     }
     
     models = {
@@ -155,17 +167,28 @@ def train_all_models(df, ticker, use_lstm=True):
             y_prob = model.predict_proba(X_test)[:, 1] if hasattr(model, 'predict_proba') else y_pred
             
             results.append({
-                "Ticker": ticker, "Model": name, "Weight": model_weights[name],
+                "Ticker": ticker,
+                "Model": name,
+                "Weight": model_weights[name],
                 "Accuracy": round(accuracy_score(y_test, y_pred), 4),
                 "Precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
                 "Recall": round(recall_score(y_test, y_pred, zero_division=0), 4),
                 "F1-Score": round(f1_score(y_test, y_pred, zero_division=0), 4)
             })
             
-            model_predictions[name] = {'pred': y_pred, 'prob': y_prob, 'weight': model_weights[name]}
+            model_predictions[name] = {
+                'pred': y_pred,
+                'prob': y_prob,
+                'weight': model_weights[name]
+            }
+            
         except Exception as e:
-            results.append({"Ticker": ticker, "Model": name, "Weight": model_weights[name],
-                            "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0})
+            results.append({
+                "Ticker": ticker,
+                "Model": name,
+                "Weight": model_weights[name],
+                "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
+            })
     
     # LSTM Model
     if use_lstm and PYTORCH_AVAILABLE:
@@ -176,39 +199,60 @@ def train_all_models(df, ticker, use_lstm=True):
             
             if len(X_train_seq) >= 50:
                 scaler = StandardScaler()
-                X_train_scaled = scaler.fit_transform(X_train_seq.reshape(-1, X_train_seq.shape[-1])).reshape(X_train_seq.shape)
-                X_test_scaled = scaler.transform(X_test_seq.reshape(-1, X_test_seq.shape[-1])).reshape(X_test_seq.shape)
+                X_train_scaled = scaler.fit_transform(
+                    X_train_seq.reshape(-1, X_train_seq.shape[-1])
+                ).reshape(X_train_seq.shape)
+                X_test_scaled = scaler.transform(
+                    X_test_seq.reshape(-1, X_test_seq.shape[-1])
+                ).reshape(X_test_seq.shape)
                 
-                train_dataset = TensorDataset(torch.FloatTensor(X_train_scaled), torch.FloatTensor(y_train_seq))
+                X_train_t = torch.FloatTensor(X_train_scaled)
+                y_train_t = torch.FloatTensor(y_train_seq)
+                X_test_t = torch.FloatTensor(X_test_scaled)
+                
+                train_dataset = TensorDataset(X_train_t, y_train_t)
                 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=False)
                 
                 lstm_model = LSTMModel(input_size=len(feature_cols))
+                criterion = nn.BCELoss()
                 optimizer = torch.optim.Adam(lstm_model.parameters(), lr=0.001)
                 
                 lstm_model.train()
                 for epoch in range(10):
                     for batch_X, batch_y in train_loader:
                         optimizer.zero_grad()
-                        loss = nn.BCELoss()(lstm_model(batch_X).squeeze(), batch_y)
+                        outputs = lstm_model(batch_X).squeeze()
+                        loss = criterion(outputs, batch_y)
                         loss.backward()
                         optimizer.step()
                 
                 lstm_model.eval()
                 with torch.no_grad():
-                    lstm_probs = lstm_model(torch.FloatTensor(X_test_scaled)).squeeze().numpy()
+                    lstm_probs = lstm_model(X_test_t).squeeze().numpy()
                     lstm_preds = (lstm_probs > 0.5).astype(int)
                 
                 results.append({
-                    "Ticker": ticker, "Model": "LSTM", "Weight": model_weights["LSTM"],
+                    "Ticker": ticker,
+                    "Model": "LSTM",
+                    "Weight": model_weights["LSTM"],
                     "Accuracy": round(accuracy_score(y_test_seq, lstm_preds), 4),
                     "Precision": round(precision_score(y_test_seq, lstm_preds, zero_division=0), 4),
                     "Recall": round(recall_score(y_test_seq, lstm_preds, zero_division=0), 4),
                     "F1-Score": round(f1_score(y_test_seq, lstm_preds, zero_division=0), 4)
                 })
                 
-                model_predictions["LSTM"] = {'pred': lstm_preds, 'prob': lstm_probs, 'weight': model_weights["LSTM"]}
-        except Exception:
-            results.append({"Ticker": ticker, "Model": "LSTM", "Weight": 2, "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0})
+                model_predictions["LSTM"] = {
+                    'pred': lstm_preds,
+                    'prob': lstm_probs,
+                    'weight': model_weights["LSTM"]
+                }
+        except Exception as e:
+            results.append({
+                "Ticker": ticker,
+                "Model": "LSTM",
+                "Weight": 2,
+                "Accuracy": 0, "Precision": 0, "Recall": 0, "F1-Score": 0
+            })
     
     # ==========================================
     # 🎯 SMART SIGNAL LOGIC (Laatste voorspelling)
@@ -235,10 +279,32 @@ def train_all_models(df, ticker, use_lstm=True):
         signal_color = "🔵"
         signal_desc = "XGBoost of LightGBM is bullish. Standaard koopsignaal."
     
-    # Ensemble berekening (voor referentie)
-    ensemble_prediction = {'signal': signal, 'signal_color': signal_color, 'signal_desc': signal_desc}
+    ensemble_prediction = {
+        'signal': signal, 
+        'signal_color': signal_color, 
+        'signal_desc': signal_desc
+    }
     
     return results, ensemble_prediction, None
+
+# ==========================================
+# KLEURCODERING FUNCTIE
+# ==========================================
+def highlight_weights(row):
+    """Kleurcodering: Groen = XGBoost/LightGBM, Blauw = LSTM"""
+    if row['Model'] in ['XGBoost', 'LightGBM']:
+        return ['background-color: #28a745; color: white; font-weight: bold'] * len(row)
+    elif row['Model'] == 'LSTM':
+        return ['background-color: #17a2b8; color: white; font-weight: bold'] * len(row)
+    return [''] * len(row)
+
+def highlight_signals(row):
+    """Kleurcodering voor overzichtstabel"""
+    if "STRONG BUY" in row['Signaal']:
+        return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
+    elif "BUY" in row['Signaal']:
+        return ['background-color: #cce5ff; color: #004085; font-weight: bold'] * len(row)
+    return [''] * len(row)
 
 # ==========================================
 # HOOFDLOGICA
@@ -251,21 +317,27 @@ if start_button:
         st.stop()
     
     st.info(f"📊 Analyseren van {len(tickers)} tickers...")
+    
     progress_bar = st.progress(0)
     status_text = st.empty()
     
     status_text.text("📥 Data ophalen...")
     try:
         all_data = yf.download(tickers, period=period, progress=False, threads=True)
+        
         if isinstance(all_data.columns, pd.MultiIndex):
-            close_data, volume_data = all_data['Close'], all_data['Volume']
+            close_data = all_data['Close']
+            volume_data = all_data['Volume']
         else:
-            close_data, volume_data = all_data[['Close']], all_data[['Volume']]
+            close_data = all_data[['Close']]
+            volume_data = all_data[['Volume']]
+        
     except Exception as e:
-        st.error(f"❌ Fout bij ophalen data: {e}")
+        st.error(f" Fout bij ophalen data: {e}")
         st.stop()
     
     ticker_data = {}
+    
     for idx, ticker in enumerate(tickers, 1):
         status_text.text(f"[{idx}/{len(tickers)}] Verwerken {ticker}...")
         progress_bar.progress(idx / len(tickers))
@@ -281,20 +353,27 @@ if start_button:
             results, ensemble_pred, error = train_all_models(df, ticker, use_lstm=True)
             
             if not error and results:
-                ticker_data[ticker] = {'results': results, 'ensemble': ensemble_pred, 'close_data': df_close, 'df': df}
-        except Exception:
+                ticker_data[ticker] = {
+                    'results': results,
+                    'ensemble': ensemble_pred,
+                    'close_data': df_close,
+                    'df': df
+                }
+                
+        except Exception as e:
             continue
     
     progress_bar.progress(1.0)
     status_text.text("✅ Analyse voltooid!")
     
     # ==========================================
-    # OVERZICHTSPAGINA
+    # OVERZICHTSPAGINA: ALLE TICKERS
     # ==========================================
     if ticker_data:
         st.success(f"✅ Succesvol verwerkt: {len(ticker_data)} tickers")
         st.markdown("---")
         
+        # Maak overzichtstabel
         overview_data = []
         for ticker, data in ticker_data.items():
             ens = data['ensemble']
@@ -305,7 +384,7 @@ if start_button:
             overview_data.append({
                 'Ticker': ticker,
                 'Signaal': f"{ens['signal_color']} {ens['signal']}",
-                'Ensemble F1': f"{results_df[results_df['Model']!='LSTM']['F1-Score'].mean():.4f}", # Exclude LSTM from avg for fair comparison
+                'Ensemble F1': f"{results_df[results_df['Model']!='LSTM']['F1-Score'].mean():.4f}",
                 'Beste Model': best_model_row['Model'],
                 'Beste F1': f"{best_model_row['F1-Score']:.4f}"
             })
@@ -321,25 +400,29 @@ if start_button:
         overview_df['Sort_Key'] = overview_df.apply(signal_sort_key, axis=1)
         overview_df = overview_df.sort_values(['Sort_Key', 'Ticker']).drop('Sort_Key', axis=1)
         
-        st.subheader("📋 Overzicht Alle Tickers & Signalen")
+        st.subheader(" Overzicht Alle Tickers & Signalen")
         st.markdown("**Klik op een ticker hieronder voor gedetailleerde informatie**")
         
-        # Kleurcodering voor de tabel
-        def highlight_signals(row):
-            if "STRONG BUY" in row['Signaal']:
-                return ['background-color: #d4edda; color: #155724; font-weight: bold'] * len(row)
-            elif "BUY" in row['Signaal']:
-                return ['background-color: #cce5ff; color: #004085; font-weight: bold'] * len(row)
-            return [''] * len(row)
+        # Legenda
+        st.markdown("""
+        **Legenda:**
+        - 🟢 **Groen** = XGBoost & LightGBM (hoofd BUY-signalen, wegen 3x)
+        - 🔵 **Blauw** = LSTM (patroonherkenner, bevestigt Strong Buy)
+        - ⚪ **Wit** = Overige ondersteunende modellen
+        """)
         
         styled_overview = overview_df.style.apply(highlight_signals, axis=1)
         st.dataframe(styled_overview, use_container_width=True, height=400)
         
         # ==========================================
-        # DETAIL WEERGAVE PER TICKER
+        # TICKER SELECTIE VOOR DETAILS
         # ==========================================
         st.markdown("---")
-        selected_ticker = st.selectbox("🎯 Selecteer een ticker voor gedetailleerde analyse:", options=list(ticker_data.keys()), index=0)
+        selected_ticker = st.selectbox(
+            " Selecteer een ticker voor gedetailleerde analyse:",
+            options=list(ticker_data.keys()),
+            index=0
+        )
         
         if selected_ticker in ticker_data:
             data = ticker_data[selected_ticker]
@@ -358,49 +441,109 @@ if start_button:
             st.info(f"**Waarom?** {ens['signal_desc']}")
             
             st.markdown("---")
-            st.subheader(f"📊 Alle Modellen voor {selected_ticker}")
+            st.subheader(f" Alle Modellen voor {selected_ticker}")
             
             results_df_sorted = results_df.sort_values('F1-Score', ascending=False)
-            
-            def highlight_weights(row):
-                if row['Model'] in ['XGBoost', 'LightGBM']:
-                    return ['background-color: #ff6b6b; color: white'] * len(row)
-                elif row['Model'] == 'LSTM':
-                    return ['background-color: #4ecdc4; color: white'] * len(row)
-                return [''] * len(row)
-            
             st.dataframe(results_df_sorted.style.apply(highlight_weights, axis=1), use_container_width=True, height=400)
             
             # Grafieken
             col1, col2 = st.columns(2)
+            
             with col1:
                 st.subheader("📊 F1-Score per Model")
                 if PLOTLY_AVAILABLE:
-                    fig = px.bar(results_df_sorted, x='F1-Score', y='Model', orientation='h', color='Weight', color_continuous_scale='RdYlGn')
+                    fig = px.bar(
+                        results_df_sorted, 
+                        x='F1-Score', 
+                        y='Model', 
+                        orientation='h',
+                        color='Weight',
+                        color_continuous_scale='RdYlGn',
+                        title=f"F1-Score per Model (Hoger = Beter)"
+                    )
+                    fig.update_layout(height=400)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.bar_chart(results_df_sorted.set_index('Model')[['F1-Score']])
+                    chart_data = results_df_sorted.set_index('Model')[['F1-Score']]
+                    st.bar_chart(chart_data)
             
             with col2:
                 st.subheader("⚖️ Model Weights")
                 weights_df = results_df_sorted[['Model', 'Weight']].drop_duplicates()
                 if PLOTLY_AVAILABLE:
-                    fig = px.pie(weights_df, values='Weight', names='Model', color_discrete_sequence=px.colors.qualitative.Set3)
+                    fig = px.pie(
+                        weights_df, 
+                        values='Weight', 
+                        names='Model',
+                        title="Gewichten in Ensemble",
+                        color_discrete_sequence=px.colors.qualitative.Set3
+                    )
+                    fig.update_layout(height=400)
                     st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.dataframe(weights_df, use_container_width=True)
             
+            # LSTM Patroonherkenning
+            st.markdown("---")
+            st.subheader("🧠 LSTM Patroonherkenning")
+            
+            lstm_row = results_df[results_df['Model'] == 'LSTM']
+            if not lstm_row.empty:
+                lstm_metrics = lstm_row.iloc[0]
+                
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("LSTM Accuracy", f"{lstm_metrics['Accuracy']:.2%}")
+                with col2:
+                    st.metric("LSTM Precision", f"{lstm_metrics['Precision']:.2%}")
+                with col3:
+                    st.metric("LSTM Recall", f"{lstm_metrics['Recall']:.2%}")
+                with col4:
+                    st.metric("LSTM F1-Score", f"{lstm_metrics['F1-Score']:.4f}")
+                
+                st.info("""
+                **LSTM (Long Short-Term Memory)** is een recurrent neural network dat 
+                tijdsafhankelijke patronen herkent in de koersdata. Het analyseert sequenties 
+                van 10 dagen om complexe niet-lineaire patronen te detecteren die traditionele 
+                modellen missen.
+                """)
+            
             # Koersgrafiek
             st.markdown("---")
             st.subheader(f"📈 {selected_ticker} Koersverloop")
+            
             close_data = data['close_data']
+            
             if PLOTLY_AVAILABLE:
-                fig = go.Figure(go.Scatter(x=close_data.index, y=close_data.values, mode='lines', line=dict(color='#00d4aa', width=2)))
-                fig.update_layout(title=f"{selected_ticker} - Laatste {len(close_data)} dagen", xaxis_title="Datum", yaxis_title="Prijs ($)", height=400)
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=close_data.index,
+                    y=close_data.values,
+                    mode='lines',
+                    name='Close Price',
+                    line=dict(color='#00d4aa', width=2)
+                ))
+                fig.update_layout(
+                    title=f"{selected_ticker} - Laatste {len(close_data)} dagen",
+                    xaxis_title="Datum",
+                    yaxis_title="Prijs ($)",
+                    height=400,
+                    hovermode='x unified'
+                )
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.line_chart(close_data)
             
             # Download
             csv = results_df.to_csv(index=False).encode('utf-8')
-            st.download_button(label=f"📥 Download {selected_ticker} data", data=csv, file_name=f"{selected_ticker}_signals.csv", mime="text/csv")
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label=f"📥 Download resultaten voor {selected_ticker}",
+                data=csv,
+                file_name=f"{selected_ticker}_predictions_{timestamp}.csv",
+                mime="text/csv"
+            )
+    
+    else:
+        st.warning("⚠️ Geen resultaten om weer te geven.")
